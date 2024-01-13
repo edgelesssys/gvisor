@@ -16,6 +16,7 @@ package nvproxy
 
 import (
 	"fmt"
+	"os"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
@@ -163,17 +164,34 @@ func uvmIoctlNoParams(ui *uvmIoctlState) (uintptr, error) {
 	return uvmIoctlInvoke[byte](ui, nil)
 }
 
-func uvmIoctlSimple[Params any, PParams marshalPtr[Params]](ui *uvmIoctlState) (uintptr, error) {
+func uvmIoctlSimple[Params any, PParams marshalPtr[Params]](ui *uvmIoctlState) (foo uintptr, retErr error) {
 	var ioctlParams Params
 	if _, err := (PParams)(&ioctlParams).CopyIn(ui.t, ui.ioctlParamsAddr); err != nil {
 		return 0, err
 	}
+
 	n, err := uvmIoctlInvoke(ui, &ioctlParams)
 	if err != nil {
 		return n, err
 	}
 	if _, err := (PParams)(&ioctlParams).CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
 		return n, err
+	}
+
+	castedOut, ok := any(ioctlParams).(nvgpu.UVM_VALIDATE_VA_RANGE_PARAMS)
+	if ok {
+		ui.ctx.Debugf("UVM_VALIDATE_VA Out: 0x%x, 0x%x, 0x%x", castedOut.Base, castedOut.Length, castedOut.RMStatus)
+
+		if castedOut.Length == 0x3ab000 {
+			ui.ctx.Debugf("sleeping for 1hr")
+			var foo string
+			fmt.Scanf("reading text %s\n", &foo)
+		}
+		// data, err := os.ReadFile("/proc/self/maps")
+		// if err == nil {
+		// 	ui.ctx.Debugf("%s", data)
+		// }
+		// ui.ctx.Debugf("ReadFile: %s", err)
 	}
 	return n, nil
 }
@@ -245,7 +263,12 @@ type hasRMCtrlFDPtr[T any] interface {
 	nvgpu.HasRMCtrlFD
 }
 
-func uvmIoctlHasRMCtrlFD[Params any, PParams hasRMCtrlFDPtr[Params]](ui *uvmIoctlState) (uintptr, error) {
+func uvmIoctlHasRMCtrlFD[Params any, PParams hasRMCtrlFDPtr[Params]](ui *uvmIoctlState) (tmp uintptr, retErr error) {
+	fmt.Fprintf(os.Stderr, "uvmIoctlHasRMCtrlFD\n")
+	defer func(){
+		fmt.Fprintf(os.Stderr, "uvmIoctlHasRMCtrlFD retErr: %s\n", retErr)
+	}()
+
 	var ioctlParams Params
 	if _, err := (PParams)(&ioctlParams).CopyIn(ui.t, ui.ioctlParamsAddr); err != nil {
 		return 0, err
@@ -260,6 +283,11 @@ func uvmIoctlHasRMCtrlFD[Params any, PParams hasRMCtrlFDPtr[Params]](ui *uvmIoct
 		if _, err := (PParams)(&ioctlParams).CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
 			return n, err
 		}
+
+		// tmpSlice := make([]byte, 64)
+		// _ = (PParams)(&ioctlParams).MarshalBytes(tmpSlice)
+		// fmt.Fprintf(os.Stderr, "HELLOFROMVUM: 0x%x, 0x%x\n", tmpSlice[0:16], tmpSlice[36:40])
+
 		return n, nil
 	}
 
@@ -285,6 +313,10 @@ func uvmIoctlHasRMCtrlFD[Params any, PParams hasRMCtrlFDPtr[Params]](ui *uvmIoct
 	if _, err := (PParams)(&outIoctlParams).CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
 		return n, err
 	}
+
+	// tmpSlice := make([]byte, 64)
+	// _ = (PParams)(&outIoctlParams).MarshalBytes(tmpSlice)
+	// fmt.Fprintf(os.Stderr, "HELLOFROMVUM: 0x%x, 0x%x\n", tmpSlice[0:16], tmpSlice[36:40])
 
 	return n, nil
 }

@@ -16,6 +16,7 @@ package linux
 
 import (
 	"bytes"
+	"fmt"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -46,6 +47,8 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 	shared := flags&linux.MAP_SHARED != 0
 	anon := flags&linux.MAP_ANONYMOUS != 0
 	map32bit := flags&linux.MAP_32BIT != 0
+
+	fmt.Printf("mmap entry: addr 0x%x, prot 0x%x, flags 0x%x\n", args[0].Pointer(), prot, flags)
 
 	// Require exactly one of MAP_PRIVATE and MAP_SHARED.
 	if private == shared {
