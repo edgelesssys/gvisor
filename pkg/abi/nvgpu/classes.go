@@ -218,6 +218,12 @@ type NV_CHANNEL_ALLOC_PARAMS struct {
 	ECCErrorNotifierMem NV_MEMORY_DESC_PARAMS
 	ProcessID           uint32
 	SubProcessID        uint32
+	// IV used for CPU-side encryption / GPU-side decryption.
+	EncryptIv [3]uint32
+	// IV used for CPU-side decryption / GPU-side encryption.
+	DecryptIv [3]uint32
+	// Nonce used CPU-side signing / GPU-side signature verification.
+	HmacNonce [8]uint32
 }
 
 // NVB0B5_ALLOCATION_PARAMETERS is the alloc param type for TURING_DMA_COPY_A,

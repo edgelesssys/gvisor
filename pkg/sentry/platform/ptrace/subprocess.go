@@ -484,7 +484,8 @@ func (t *thread) syscall(regs *arch.Registers) (uintptr, error) {
 func (t *thread) syscallIgnoreInterrupt(
 	initRegs *arch.Registers,
 	sysno uintptr,
-	args ...arch.SyscallArgument) (uintptr, error) {
+	args ...arch.SyscallArgument,
+) (uintptr, error) {
 	for {
 		regs := createSyscallRegs(initRegs, sysno, args...)
 		rval, err := t.syscall(&regs)
@@ -639,6 +640,9 @@ func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRa
 	if precommit {
 		flags |= unix.MAP_POPULATE
 	}
+
+	fmt.Printf("subprocess.MapFile: addr %x, prot %x, flags %x\n", addr, at.Prot(), flags)
+
 	_, err := s.syscall(
 		unix.SYS_MMAP,
 		arch.SyscallArgument{Value: uintptr(addr)},

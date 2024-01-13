@@ -602,6 +602,10 @@ type Task struct {
 	sessionKeyring *auth.Key
 }
 
+func (t *Task) LogPrefix() string {
+	return (t.logPrefix.Load()).(string)
+}
+
 // Task related metrics
 var (
 	// syscallCounter is a metric that tracks how many syscalls the sentry has
