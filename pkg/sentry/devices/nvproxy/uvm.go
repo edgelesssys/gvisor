@@ -182,11 +182,6 @@ func uvmIoctlSimple[Params any, PParams marshalPtr[Params]](ui *uvmIoctlState) (
 	if ok {
 		ui.ctx.Debugf("UVM_VALIDATE_VA Out: 0x%x, 0x%x, 0x%x", castedOut.Base, castedOut.Length, castedOut.RMStatus)
 
-		if castedOut.Length == 0x3ab000 {
-			ui.ctx.Debugf("sleeping for 1hr")
-			var foo string
-			fmt.Scanf("reading text %s\n", &foo)
-		}
 		// data, err := os.ReadFile("/proc/self/maps")
 		// if err == nil {
 		// 	ui.ctx.Debugf("%s", data)
