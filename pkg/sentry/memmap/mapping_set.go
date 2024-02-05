@@ -193,6 +193,7 @@ func (s *MappingSet) AddMapping(ms MappingSpace, ar hostarch.AddrRange, offset u
 			gapMR := gap.Range().Intersect(mr)
 			mapped = append(mapped, gapMR)
 			// Insert a set and continue from the above case.
+			// seg, gap = s.InsertWithoutMerging(gap, gapMR, make(MappingsOfRange)), MappingGapIterator{}
 			seg, gap = s.Insert(gap, gapMR, make(MappingsOfRange)), MappingGapIterator{}
 
 		default:

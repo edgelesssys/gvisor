@@ -125,7 +125,10 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		hint:           opts.Hint,
 	}
 
+	// vseg := mm.vmas.InsertWithoutMerging(vgap, ar, v)
 	vseg := mm.vmas.Insert(vgap, ar, v)
+	// fmt.Printf("createVMALocked: InsertWithoutMerging vseg %#v\n", vseg)
+
 	mm.usageAS += opts.Length
 	if v.isPrivateDataLocked() {
 		mm.dataAS += opts.Length

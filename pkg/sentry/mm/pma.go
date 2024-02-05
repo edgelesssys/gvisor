@@ -123,6 +123,7 @@ func (mm *MemoryManager) getPMAsLocked(ctx context.Context, vseg vmaIterator, ar
 	ar = hostarch.AddrRange{ar.Start.RoundDown(), end}
 
 	pstart, pend, perr := mm.getPMAsInternalLocked(ctx, vseg, ar, at)
+	// fmt.Printf("getPMAsLocked: getPMAsInternalLocked pstart.Range %#v\n", pstart)
 	if pend.Start() <= ar.Start {
 		return pmaIterator{}, pend, perr
 	}
@@ -130,6 +131,7 @@ func (mm *MemoryManager) getPMAsLocked(ctx context.Context, vseg vmaIterator, ar
 	// invalidation.
 	if !pstart.Ok() {
 		pstart = mm.findOrSeekPrevUpperBoundPMA(ar.Start, pend)
+		// fmt.Printf("getPMAsLocked: findOrSeekPrevUpperBoundPMA pstart.Range %#v pend %#v\n", pstart.Range(), pend.Range())
 	}
 	if perr != nil {
 		return pstart, pend, perr
@@ -228,6 +230,13 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 		vma := vseg.ValuePtr()
 	pmaLoop:
 		for {
+			// fmt.Printf("getPMAsInternalLocked: loophead vsegAR %#v\n", vsegAR)
+			// if pgap.Ok() {
+				// fmt.Printf("getPMAsInternalLocked: loophead pgap.Range %#v\n", pgap.Range())
+			// }
+			// if pseg.Ok() {
+				// fmt.Printf("getPMAsInternalLocked: loophead pseg.Range %#v\n", pseg.Range())
+			// }
 			switch {
 			case pgap.Ok() && pgap.Start() < vsegAR.End:
 				// Need a pma here.
@@ -238,6 +247,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					}
 				}
 				if vma.mappable == nil {
+					// fmt.Printf("getPMAsInternalLocked: case 1 if 1\n")
 					// Private anonymous mappings get pmas by allocating.
 					allocAR := optAR.Intersect(maskAR)
 					fr, err := mm.mf.Allocate(uint64(allocAR.Length()), opts)
@@ -263,6 +273,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					}).NextNonEmpty()
 					pstart = pmaIterator{} // iterators invalidated
 				} else {
+					// fmt.Printf("getPMAsInternalLocked: case 1 else 1\n")
 					// Other mappings get pmas by translating.
 					optMR := vseg.mappableRangeOf(optAR)
 					reqAR := optAR.Intersect(ar)
@@ -324,8 +335,10 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 				}
 
 			case pseg.Ok() && pseg.Start() < vsegAR.End:
+				// fmt.Printf("getPMAsInternalLocked: case 2 pseg.Range %#v pgap.Range %#v\n", pseg.Range(), pgap.Range())
 				oldpma := pseg.ValuePtr()
 				if at.Write && mm.isPMACopyOnWriteLocked(vseg, pseg) {
+					// fmt.Printf("getPMAsInternalLocked: case 2 if 1\n")
 					// Break copy-on-write by copying.
 					if checkInvariants {
 						if !oldpma.maxPerms.Read {
@@ -412,13 +425,16 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					oldpma.private = true
 					oldpma.internalMappings = safemem.BlockSeq{}
 					// Try to merge the pma with its neighbors.
+					// fmt.Printf("getPMAsInternalLocked: case 2 if 1 ar %#v\n", ar)
 					if prev := pseg.PrevSegment(); prev.Ok() {
+						// fmt.Printf("getPMAsInternalLocked: wants to merge prev\n")
 						if merged := mm.pmas.Merge(prev, pseg); merged.Ok() {
 							pseg = merged
 							pstart = pmaIterator{} // iterators invalidated
 						}
 					}
 					if next := pseg.NextSegment(); next.Ok() {
+						// fmt.Printf("getPMAsInternalLocked: wants to merge next\n")
 						if merged := mm.pmas.Merge(pseg, next); merged.Ok() {
 							pseg = merged
 							pstart = pmaIterator{} // iterators invalidated
@@ -433,6 +449,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					// of the loop.
 					pseg, pgap = pseg.NextNonEmpty()
 				} else if !oldpma.translatePerms.SupersetOf(at) {
+					// fmt.Printf("getPMAsInternalLocked: case 2 else 1\n")
 					// Get new pmas (with sufficient permissions) by calling
 					// memmap.Mappable.Translate again.
 					if checkInvariants {
@@ -501,9 +518,11 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 				} else {
 					// We have a usable pma; continue.
 					pseg, pgap = pseg.NextNonEmpty()
+					// fmt.Printf("getPMAsInternalLocked: case 2 NextNonEmpty\n")
 				}
 
 			default:
+				// fmt.Printf("getPMAsInternalLocked: default pseg.Range %#v pgap.Range %#v\n", pseg.Range(), pgap.Range())
 				break pmaLoop
 			}
 		}
@@ -1001,6 +1020,7 @@ func (mm *MemoryManager) findOrSeekPrevUpperBoundPMA(addr hostarch.Addr, pgap pm
 	// which is the case if findOrSeekPrevUpperBoundPMA is called to find the
 	// start of a range containing only a single PMA.
 	if pseg := pgap.PrevSegment(); pseg.Start() <= addr {
+		// fmt.Printf("findOrSeekPrevUpperBoundPMA: pgap.PrevSegment %#v\n", pseg)
 		return pseg
 	}
 	return mm.pmas.UpperBoundSegment(addr)

@@ -16,7 +16,6 @@ package nvproxy
 
 import (
 	"fmt"
-	"os"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
@@ -181,6 +180,7 @@ func uvmIoctlSimple[Params any, PParams marshalPtr[Params]](ui *uvmIoctlState) (
 	castedOut, ok := any(ioctlParams).(nvgpu.UVM_VALIDATE_VA_RANGE_PARAMS)
 	if ok {
 		ui.ctx.Debugf("UVM_VALIDATE_VA Out: 0x%x, 0x%x, 0x%x", castedOut.Base, castedOut.Length, castedOut.RMStatus)
+		ui.t.DebugDumpState()
 
 		if castedOut.Length == 0x3ab000 {
 			ui.ctx.Debugf("sleeping for 1hr")
@@ -264,10 +264,10 @@ type hasRMCtrlFDPtr[T any] interface {
 }
 
 func uvmIoctlHasRMCtrlFD[Params any, PParams hasRMCtrlFDPtr[Params]](ui *uvmIoctlState) (tmp uintptr, retErr error) {
-	fmt.Fprintf(os.Stderr, "uvmIoctlHasRMCtrlFD\n")
-	defer func(){
-		fmt.Fprintf(os.Stderr, "uvmIoctlHasRMCtrlFD retErr: %s\n", retErr)
-	}()
+	// fmt.Fprintf(os.Stderr, "uvmIoctlHasRMCtrlFD\n")
+	// defer func(){
+	// 	fmt.Fprintf(os.Stderr, "uvmIoctlHasRMCtrlFD retErr: %s\n", retErr)
+	// }()
 
 	var ioctlParams Params
 	if _, err := (PParams)(&ioctlParams).CopyIn(ui.t, ui.ioctlParamsAddr); err != nil {

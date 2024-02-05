@@ -32,6 +32,7 @@ func (fd *uvmFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error
 	if opts.PlatformEffect < memmap.PlatformEffectPopulate {
 		opts.PlatformEffect = memmap.PlatformEffectPopulate
 	}
+	opts.PlatformEffect = memmap.PlatformEffectCommit
 	return vfs.GenericConfigureMMap(&fd.vfsfd, fd, opts)
 }
 

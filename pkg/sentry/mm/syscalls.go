@@ -209,6 +209,8 @@ func (mm *MemoryManager) populateVMA(ctx context.Context, vseg vmaIterator, ar h
 // Postconditions: mm.mappingMu will be unlocked.
 // +checklocksrelease:mm.mappingMu
 func (mm *MemoryManager) populateVMAAndUnlock(ctx context.Context, vseg vmaIterator, ar hostarch.AddrRange, precommit bool) {
+	fmt.Printf("populateVMAAndUnlock: %#v\n", ar)
+
 	// See populateVMA above for commentary.
 	if !vseg.ValuePtr().effectivePerms.Any() {
 		mm.mappingMu.Unlock()
@@ -227,6 +229,9 @@ func (mm *MemoryManager) populateVMAAndUnlock(ctx context.Context, vseg vmaItera
 	// isn't needed at all for mapASLocked.
 	mm.mappingMu.DowngradeLock()
 	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, hostarch.NoAccess)
+
+	fmt.Printf("populateVMAAndUnlock: getPMAsLocked %#v\n", pseg.Range())
+
 	mm.mappingMu.RUnlock()
 	if err != nil {
 		mm.activeMu.Unlock()

@@ -172,6 +172,7 @@ func (mm *MemoryManager) Deactivate() {
 //   - ar must be page-aligned.
 //   - pseg == mm.pmas.LowerBoundSegment(ar.Start).
 func (mm *MemoryManager) mapASLocked(pseg pmaIterator, ar hostarch.AddrRange, precommit bool) error {
+	fmt.Printf("mapASLocked: %#v\n", ar)
 	// By default, map entire pmas at a time, under the assumption that there
 	// is no cost to mapping more of a pma than necessary.
 	mapAR := hostarch.AddrRange{0, ^hostarch.Addr(hostarch.PageSize - 1)}
@@ -182,7 +183,9 @@ func (mm *MemoryManager) mapASLocked(pseg pmaIterator, ar hostarch.AddrRange, pr
 	} else if mapUnit := mm.p.MapUnit(); mapUnit != 0 {
 		// Limit the range we map to ar, aligned to mapUnit.
 		mapMask := hostarch.Addr(mapUnit - 1)
+
 		mapAR.Start = ar.Start &^ mapMask
+		// fmt.Printf("mapASLocked: mapAR.Start 0x%x\n", mapAR.Start)
 		// If rounding ar.End up overflows, just keep the existing mapAR.End.
 		if end := (ar.End + mapMask) &^ mapMask; end >= ar.End {
 			mapAR.End = end
@@ -194,17 +197,20 @@ func (mm *MemoryManager) mapASLocked(pseg pmaIterator, ar hostarch.AddrRange, pr
 		}
 	}
 
+	// fmt.Printf("mapASLocker: mapAR.Start 0x%x mapAR.End 0x%x len 0x%x\n", mapAR.Start, mapAR.End, mapAR.End - mapAR.Start)
 	// Since this checks ar.End and not mapAR.End, we will never map a pma that
 	// is not required.
 	for pseg.Ok() && pseg.Start() < ar.End {
 		pma := pseg.ValuePtr()
 		pmaAR := pseg.Range()
 		pmaMapAR := pmaAR.Intersect(mapAR)
+		// fmt.Printf("mapASLocked: pseg %#v pmaMapAR %#v pmaAR %#v\n", pseg, pmaMapAR, pmaAR)
 		perms := pma.effectivePerms
 		if pma.needCOW {
 			perms.Write = false
 		}
 		if perms.Any() { // MapFile precondition
+			// fmt.Printf("mapASLocked: MapFile 0x%x, len 0x%x, fd %d\n", pmaMapAR.Start, pseg.fileRangeOf(pmaMapAR).Length(), pma.file.FD())
 			if err := mm.as.MapFile(pmaMapAR.Start, pma.file, pseg.fileRangeOf(pmaMapAR), perms, precommit); err != nil {
 				return err
 			}

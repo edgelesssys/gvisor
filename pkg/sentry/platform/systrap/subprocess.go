@@ -895,6 +895,17 @@ func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintp
 
 // MapFile implements platform.AddressSpace.MapFile.
 func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
+	// fmt.Printf("MapFile: addr 0x%x, len 0x%x, fd %d, offset 0x%x\n", addr, fr.Length(), f.FD(), fr.Start)
+
+	// length := fr.Length()
+	// offset := uintptr(fr.Start)
+	// if length == 0x5ab000 {
+	// 	addr = addr+0x200000
+	// 	length = 0x3ab000
+	// 	offset = uintptr(addr)
+	// 	fmt.Println("MapFile: modified")
+	// }
+
 	var flags int
 	if precommit {
 		flags |= unix.MAP_POPULATE
