@@ -91,6 +91,8 @@ func ioctl(ctx context.Context, fd int, io usermem.IO, sysno uintptr, args arch.
 		}
 		_, err := ifr.CopyOut(cc, args[2].Pointer())
 		return 0, err
+	case linux.SIOCGIFADDR:
+		return 0, nil
 	case linux.SIOCGIFCONF:
 		cc := &usermem.IOCopyContext{
 			Ctx: ctx,
