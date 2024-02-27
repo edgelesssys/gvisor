@@ -136,4 +136,4 @@ find . -type d -exec chmod 0755 {} \;
 git add --all && git commit --allow-empty -m "Merge ${head} (automated)"
 
 # Push the branch back to the original repository.
-git remote add orig "${repo_orig}" && git push -f orig go:go
+git remote add orig git@github.com:edgelesssys/gvisor.git && git push -f orig go:go
