@@ -200,7 +200,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		return nil, err
 	}
 
-	if err := os.MkdirAll(conf.RootDir, 0711); err != nil {
+	if err := os.MkdirAll(conf.RootDir, 0o711); err != nil {
 		return nil, fmt.Errorf("creating container root directory %q: %v", conf.RootDir, err)
 	}
 
@@ -338,7 +338,6 @@ func New(conf *config.Config, args Args) (*Container, error) {
 			}
 			c.Sandbox = sand
 			return nil
-
 		}); err != nil {
 			return nil, err
 		}
@@ -411,7 +410,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	// Write the PID file. Containerd considers the call to create complete after
 	// this file is created, so it must be the last thing we do.
 	if args.PIDFile != "" {
-		if err := ioutil.WriteFile(args.PIDFile, []byte(strconv.Itoa(c.SandboxPid())), 0644); err != nil {
+		if err := ioutil.WriteFile(args.PIDFile, []byte(strconv.Itoa(c.SandboxPid())), 0o644); err != nil {
 			return nil, fmt.Errorf("error writing PID file: %v", err)
 		}
 	}
@@ -1027,7 +1026,7 @@ func (c *Container) createGoferFilestoreInSelf(mountSrc string, isShared bool, s
 		createFlags |= unix.O_EXCL
 	}
 	filestorePath := boot.SelfFilestorePath(mountSrc, c.sandboxID())
-	filestoreFD, err := unix.Open(filestorePath, createFlags, 0666)
+	filestoreFD, err := unix.Open(filestorePath, createFlags, 0o666)
 	if err != nil {
 		if err == unix.EEXIST {
 			// Note that if the same submount is mounted multiple times within the
@@ -1554,7 +1553,7 @@ func adjustSandboxOOMScoreAdj(s *sandbox.Sandbox, spec *specs.Spec, rootDir stri
 // /proc must be available and mounted read-write. scoreAdj should be between
 // -1000 and 1000. It's a noop if the process has already exited.
 func setOOMScoreAdj(pid int, scoreAdj int) error {
-	f, err := os.OpenFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid), os.O_WRONLY, 0644)
+	f, err := os.OpenFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid), os.O_WRONLY, 0o644)
 	if err != nil {
 		// Ignore NotExist errors because it can race with process exit.
 		if os.IsNotExist(err) {
@@ -1936,7 +1935,7 @@ func nvproxySetupAfterGoferUserns(spec *specs.Spec, conf *config.Config, goferCm
 	}
 
 	// nvidia-container-cli does not create this directory.
-	if err := os.MkdirAll(path.Join(spec.Root.Path, "proc", "driver", "nvidia"), 0555); err != nil {
+	if err := os.MkdirAll(path.Join(spec.Root.Path, "proc", "driver", "nvidia"), 0o555); err != nil {
 		return nil, fmt.Errorf("failed to create /proc/driver/nvidia in app filesystem: %w", err)
 	}
 
@@ -1949,6 +1948,8 @@ func nvproxySetupAfterGoferUserns(spec *specs.Spec, conf *config.Config, goferCm
 	var ldconfigPath string
 	if _, err := os.Stat("/sbin/ldconfig.real"); err == nil {
 		ldconfigPath = "/sbin/ldconfig.real"
+	} else if _, err := os.Stat("/run/current-system/sw/bin/ldconfig"); err == nil {
+		ldconfigPath = "/run/current-system/sw/bin/ldconfig"
 	} else {
 		ldconfigPath = "/sbin/ldconfig"
 	}
