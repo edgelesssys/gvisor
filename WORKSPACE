@@ -114,8 +114,8 @@ go_repository(
 go_repository(
     name = "org_golang_x_sys",
     importpath = "golang.org/x/sys",
-    sum = "h1:25cE3gD+tdBA7lp7QfhuV+rJiE9YXTcS3VG1SqssI/Y=",
-    version = "v0.17.0",
+    sum = "h1:rF+pYz3DAGSQAxAu1CbC7catZg4ebC4UIeIhKxBZvws=",
+    version = "v0.21.0",
 )
 
 go_repository(
@@ -156,8 +156,8 @@ go_repository(
 go_repository(
     name = "com_github_prometheus_client_model",
     importpath = "github.com/prometheus/client_model",
-    sum = "h1:UBgGFHqYdG/TPFD1B1ogZywDqEkwp3fBMvqdiQ7Xew4=",
-    version = "v0.3.0",
+    sum = "h1:gQz4mCbXsO+nc9n1hCxHcGA3Zx3Eo+UHZoInFGUIXNM=",
+    version = "v0.0.0-20190812154241-14fe0d1b01d4",
 )
 
 go_repository(
@@ -198,6 +198,7 @@ register_toolchains("//:cc_toolchain_k8", "//:cc_toolchain_aarch64")
 
 # Load LLVM dependencies.
 LLVM_COMMIT = "926f85db98aae66ab8f57b9981f47ddddb868c51"
+
 LLVM_SHA256 = "c78c94b2a03b2cf6ef1ba035c31a6f1b0bb7913da8af5aa8d5c2061f6499d589"
 
 http_archive(
@@ -238,12 +239,12 @@ maybe(
 
 # Load other C++ dependencies.
 http_archive(
-  name = "nlohmann_json",
-  sha256 = "ba6e7817353793d13e5214ed819ea5b0defc0ffb2a348f4e34b10ac6f1c50154",
-  strip_prefix = "json-960b763ecd144f156d05ec61f577b04107290137",
-  urls = [
-    "https://github.com/nlohmann/json/archive/960b763ecd144f156d05ec61f577b04107290137.tar.gz"
-  ]
+    name = "nlohmann_json",
+    sha256 = "ba6e7817353793d13e5214ed819ea5b0defc0ffb2a348f4e34b10ac6f1c50154",
+    strip_prefix = "json-960b763ecd144f156d05ec61f577b04107290137",
+    urls = [
+        "https://github.com/nlohmann/json/archive/960b763ecd144f156d05ec61f577b04107290137.tar.gz",
+    ],
 )
 
 http_archive(
@@ -1485,6 +1486,13 @@ go_repository(
     importpath = "github.com/moby/sys/mountinfo",
     sum = "h1:BzJjoreD5BMFNmD9Rus6gdd1pLuecOFPt8wC+Vygl78=",
     version = "v0.6.2",
+)
+
+go_repository(
+    name = "org_golang_google_grpc_cmd_protoc_gen_go_grpc",
+    importpath = "google.golang.org/grpc/cmd/protoc-gen-go-grpc",
+    sum = "h1:rNBFJjBCOgVr9pWD7rs/knKL4FRTKgpZmsRfV214zcA=",
+    version = "v1.3.0",
 )
 
 go_repository(
