@@ -15,21 +15,22 @@
 package fuse
 
 import (
-	"fmt"
-	"sync"
-	"time"
+	gotime "time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // +stateify savable
@@ -44,7 +45,6 @@ type fileHandle struct {
 // +stateify savable
 type inode struct {
 	inodeRefs
-	kernfs.InodeAlwaysValid
 	kernfs.InodeNotAnonymous
 	kernfs.InodeNotSymlink
 	kernfs.InodeWatches
@@ -54,15 +54,24 @@ type inode struct {
 	// the owning filesystem. fs is immutable.
 	fs *filesystem
 
-	// nodeID is a unique id which identifies the inode between userspace
-	// and the sentry. Immutable.
-	nodeID uint64
+	// nodeID is a unique id which identifies the inode between userspace and
+	// the sentry. generation is used to distinguish inodes in case of nodeID
+	// reuse. Both are immutable.
+	nodeID     uint64
+	generation uint64
+
+	// entryTime is the time at which the entry must be revalidated. Reading
+	// entryTime requires either using entryTimeSeq and SeqAtomicLoadTime, or
+	// that attrMu is locked. Writing entryTime requires that attrMu is locked
+	// and that entryTimeSeq is in a writer critical section.
+	entryTimeSeq sync.SeqCount `state:"nosave"`
+	entryTime    time.Time
 
 	// attrVersion is the version of the last attribute change.
 	attrVersion atomicbitops.Uint64
 
-	// attrTime is the time until the attributes are valid.
-	attrTime uint64
+	// attrTime is the time at which the attributes become invalid.
+	attrTime time.Time
 
 	// link is result of following a symbolic link.
 	link string
@@ -103,14 +112,6 @@ type inode struct {
 
 	// +checklocks:attrMu
 	blockSize atomicbitops.Uint32 // 0 if unknown.
-}
-
-func blockerFromContext(ctx context.Context) context.Blocker {
-	kernelTask := kernel.TaskFromContext(ctx)
-	if kernelTask == nil {
-		return ctx
-	}
-	return kernelTask
 }
 
 func pidFromContext(ctx context.Context) uint32 {
@@ -169,12 +170,9 @@ func (i *inode) touchAtime() {
 	i.atime.Store(i.fs.clock.Now().Nanoseconds())
 }
 
+// Precondition: isValidType(mode) == true.
 // +checklocks:i.attrMu
 func (i *inode) init(creds *auth.Credentials, devMajor, devMinor uint32, nodeid uint64, mode linux.FileMode, nlink uint32) {
-	if mode.FileType() == 0 {
-		panic(fmt.Sprintf("No file type specified in 'mode' for InodeAttrs.Init(): mode=0%o", mode))
-	}
-
 	i.nodeID = nodeid
 	i.ino.Store(nodeid)
 	i.mode.Store(uint32(mode))
@@ -187,6 +185,12 @@ func (i *inode) init(creds *auth.Credentials, devMajor, devMinor uint32, nodeid 
 	i.atime.Store(now)
 	i.mtime.Store(now)
 	i.ctime.Store(now)
+}
+
+// +checklocks:i.attrMu
+func (i *inode) updateEntryTime(entrySec, entryNSec int64) {
+	entryTime := time.FromTimespec(linux.Timespec{Sec: entrySec, Nsec: entryNSec})
+	SeqAtomicStoreTime(&i.entryTimeSeq, &i.entryTime, i.fs.clock.Now().AddTime(entryTime))
 }
 
 // CheckPermissions implements kernfs.Inode.CheckPermissions.
@@ -219,7 +223,7 @@ func (i *inode) CheckPermissions(ctx context.Context, creds *auth.Credentials, a
 	refreshed := false
 	opts := vfs.StatOptions{Mask: linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID}
 	if i.fs.opts.defaultPermissions || (ats.MayExec() && i.filemode().FileType() == linux.S_IFREG) {
-		if uint64(i.fs.clock.Now().Nanoseconds()) > i.attrTime {
+		if i.fs.clock.Now().After(i.attrTime) {
 			refreshed = true
 			if _, err := i.getAttr(ctx, i.fs.VFSFilesystem(), opts, 0, 0); err != nil {
 				return err
@@ -264,7 +268,7 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 		fdImpl vfs.FileDescriptionImpl
 		opcode linux.FUSEOpcode
 	)
-	switch i.filemode().FileType() {
+	switch ft := i.filemode().FileType(); ft {
 	case linux.S_IFREG:
 		regularFD := &regularFileFD{}
 		fd = &(regularFD.fileDescription)
@@ -286,6 +290,9 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 		opcode = linux.FUSE_OPENDIR
 	case linux.S_IFLNK:
 		return nil, linuxerr.ELOOP
+	default:
+		log.Warningf("Open on unknown file type: %v", ft)
+		return nil, linuxerr.EINVAL
 	}
 
 	fd.LockFD.Init(&i.locks)
@@ -363,6 +370,47 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 		return nil, err
 	}
 	return &fd.vfsfd, nil
+}
+
+func (i *inode) Valid(ctx context.Context, parent *kernfs.Dentry, name string) bool {
+	now := i.fs.clock.Now()
+	if entryTime := SeqAtomicLoadTime(&i.entryTimeSeq, &i.entryTime); entryTime.After(now) {
+		return true
+	}
+
+	i.attrMu.Lock()
+	defer i.attrMu.Unlock()
+	if i.entryTime.After(now) {
+		return true
+	}
+
+	in := linux.FUSELookupIn{Name: linux.CString(name)}
+	req := i.fs.conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), parent.Inode().(*inode).nodeID, linux.FUSE_LOOKUP, &in)
+	res, err := i.fs.conn.Call(ctx, req)
+	if err != nil {
+		return false
+	}
+	if res.Error() != nil {
+		return false
+	}
+	var out linux.FUSEEntryOut
+	if res.UnmarshalPayload(&out) != nil {
+		return false
+	}
+	if i.nodeID != out.NodeID {
+		return false
+	}
+	// Don't enforce fuse_invalid_attr() => fuse_valid_type(),
+	// fuse_valid_size() since inode.updateAttrs() and its callers
+	// don't. But do enforce fuse_stale_inode():
+	if i.generation != out.Generation {
+		return false
+	}
+	if (i.mode.RacyLoad()^out.Attr.Mode)&linux.S_IFMT != 0 {
+		return false
+	}
+	i.updateEntryTime(int64(out.EntryValid), int64(out.EntryValidNSec))
+	return true
 }
 
 // Lookup implements kernfs.Inode.Lookup.
@@ -508,7 +556,10 @@ func (i *inode) newEntry(ctx context.Context, name string, fileType linux.FileMo
 	if opcode != linux.FUSE_LOOKUP && ((out.Attr.Mode&linux.S_IFMT)^uint32(fileType) != 0 || out.NodeID == 0 || out.NodeID == linux.FUSE_ROOT_ID) {
 		return nil, linuxerr.EIO
 	}
-	child := i.fs.newInode(ctx, out.NodeID, out.Attr)
+	child, err := i.fs.newInode(ctx, out.FUSEEntryOut)
+	if err != nil {
+		return nil, err
+	}
 	if opcode == linux.FUSE_CREATE {
 		// File handler is returned by fuse server at a time of file create.
 		// Save it temporary in a created child, so Open could return it when invoked
@@ -544,7 +595,7 @@ func (i *inode) Readlink(ctx context.Context, mnt *vfs.Mount) (string, error) {
 		}
 		i.link = string(res.data[res.hdr.SizeBytes():])
 		if !mnt.Options().ReadOnly {
-			i.attrTime = 0
+			i.attrTime = time.ZeroTime
 		}
 	}
 	return i.link, nil
@@ -554,7 +605,7 @@ func (i *inode) Readlink(ctx context.Context, mnt *vfs.Mount) (string, error) {
 //
 // +checklocks:i.attrMu
 func (i *inode) getFUSEAttr() linux.FUSEAttr {
-	ns := time.Second.Nanoseconds()
+	ns := gotime.Second.Nanoseconds()
 	return linux.FUSEAttr{
 		Ino:       i.nodeID,
 		UID:       i.uid.Load(),
@@ -666,7 +717,7 @@ func (i *inode) getAttr(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOp
 		return i.getFUSEAttr(), nil
 	}
 	i.fs.conn.mu.Unlock()
-	i.updateAttrs(out.Attr, out.AttrValid)
+	i.updateAttrs(out.Attr, int64(out.AttrValid), int64(out.AttrValidNsec))
 	return out.Attr, nil
 }
 
@@ -809,16 +860,16 @@ func (i *inode) setAttr(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 	if err := res.UnmarshalPayload(&out); err != nil {
 		return err
 	}
-	i.updateAttrs(out.Attr, out.AttrValid)
+	i.updateAttrs(out.Attr, int64(out.AttrValid), int64(out.AttrValidNsec))
 	return nil
 }
 
 // +checklocks:i.attrMu
-func (i *inode) updateAttrs(attr linux.FUSEAttr, attrTimeout uint64) {
+func (i *inode) updateAttrs(attr linux.FUSEAttr, validSec, validNSec int64) {
 	i.fs.conn.mu.Lock()
 	i.attrVersion.Store(i.fs.conn.attributeVersion.Add(1))
 	i.fs.conn.mu.Unlock()
-	i.attrTime = attrTimeout
+	i.attrTime = i.fs.clock.Now().AddTime(time.FromTimespec(linux.Timespec{Sec: validSec, Nsec: validNSec}))
 
 	i.ino.Store(attr.Ino)
 

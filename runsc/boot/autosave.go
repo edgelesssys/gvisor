@@ -15,10 +15,11 @@
 package boot
 
 import (
+	"bytes"
 	"fmt"
-	"os"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -27,33 +28,71 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
-// EnableAutosave enables auto save restore in syscall tests.
-func EnableAutosave(l *Loader, f *os.File) error {
-	var once sync.Once // Used by target.
-	target := func(k *kernel.Kernel) {
-		once.Do(func() {
-			t, _ := state.CPUTime()
-			log.Infof("Before save CPU usage: %s", t.String())
-			saveOpts := state.SaveOpts{
-				Destination: f,
-				Key:         nil,
-				Callback: func(err error) {
-					t1, _ := state.CPUTime()
-					log.Infof("Save CPU usage: %s", (t1 - t).String())
-					if err == nil {
-						log.Infof("Save succeeded: exiting...")
-						k.SetSaveSuccess(true)
-					} else {
-						log.Warningf("Save failed: exiting... %v", err)
-						k.SetSaveError(err)
-					}
-
-					// Kill the sandbox.
-					k.Kill(linux.WaitStatusExit(0))
-				},
+func getSaveOpts(l *Loader, k *kernel.Kernel, isResume bool) state.SaveOpts {
+	t, _ := state.CPUTime()
+	log.Infof("Before save CPU usage: %s", t.String())
+	saveOpts := state.SaveOpts{
+		Key:    nil,
+		Resume: isResume,
+		Callback: func(err error) {
+			t1, _ := state.CPUTime()
+			log.Infof("Save CPU usage: %s", (t1 - t).String())
+			if err == nil {
+				log.Infof("Save succeeded: exiting...")
+				k.SetSaveSuccess(true)
+			} else {
+				log.Warningf("Save failed: exiting... %v", err)
+				k.SetSaveError(err)
 			}
+
+			if !isResume {
+				// Kill the sandbox.
+				k.Kill(linux.WaitStatusExit(0))
+			}
+		},
+	}
+	return saveOpts
+}
+
+func getTargetForSaveResume(l *Loader) func(k *kernel.Kernel) {
+	return func(k *kernel.Kernel) {
+		saveOpts := getSaveOpts(l, k, true /* isResume */)
+		// Store the state file contents in a buffer for save-resume.
+		// There is no need to verify the state file, we just need the
+		// sandbox to continue running after save.
+		var buf bytes.Buffer
+		saveOpts.Destination = &buf
+		saveOpts.Save(k.SupervisorContext(), k, l.watchdog)
+	}
+}
+
+func getTargetForSaveRestore(l *Loader, files []*fd.FD) func(k *kernel.Kernel) {
+	if len(files) != 1 && len(files) != 3 {
+		panic(fmt.Sprintf("Unexpected number of files: %v", len(files)))
+	}
+
+	var once sync.Once
+	return func(k *kernel.Kernel) {
+		once.Do(func() {
+			saveOpts := getSaveOpts(l, k, false /* isResume */)
+			saveOpts.Destination = files[0]
+			if len(files) == 3 {
+				saveOpts.PagesMetadata = files[1]
+				saveOpts.PagesFile = files[2]
+			}
+
 			saveOpts.Save(k.SupervisorContext(), k, l.watchdog)
 		})
+	}
+}
+
+// enableAutosave enables auto save restore in syscall tests.
+func enableAutosave(l *Loader, isResume bool, files []*fd.FD) error {
+	var target func(k *kernel.Kernel)
+	if isResume {
+		target = getTargetForSaveResume(l)
+	} else {
+		target = getTargetForSaveRestore(l, files)
 	}
 
 	for _, table := range kernel.SyscallTables() {

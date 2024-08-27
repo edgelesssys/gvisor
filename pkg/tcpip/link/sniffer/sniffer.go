@@ -44,6 +44,7 @@ var LogPackets atomicbitops.Uint32 = atomicbitops.FromUint32(1)
 // sniffer was created for this flag to have effect.
 var LogPacketsToPCAP atomicbitops.Uint32 = atomicbitops.FromUint32(1)
 
+// +stateify savable
 type endpoint struct {
 	nested.Endpoint
 	writer     io.Writer
@@ -133,14 +134,14 @@ func NewWithWriter(lower stack.LinkEndpoint, writer io.Writer, snapLen uint32) (
 // DeliverNetworkPacket implements the stack.NetworkDispatcher interface. It is
 // called by the link-layer endpoint being wrapped when a packet arrives, and
 // logs the packet before forwarding to the actual dispatcher.
-func (e *endpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+func (e *endpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	e.dumpPacket(DirectionRecv, protocol, pkt)
 	e.Endpoint.DeliverNetworkPacket(protocol, pkt)
 }
 
-func (e *endpoint) dumpPacket(dir Direction, protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+func (e *endpoint) dumpPacket(dir Direction, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	writer := e.writer
-	if writer == nil && LogPackets.Load() == 1 {
+	if LogPackets.Load() == 1 {
 		LogPacket(e.logPrefix, dir, protocol, pkt)
 	}
 	if writer != nil && LogPacketsToPCAP.Load() == 1 {
@@ -170,7 +171,7 @@ func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 }
 
 // LogPacket logs a packet to stdout.
-func LogPacket(prefix string, dir Direction, protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+func LogPacket(prefix string, dir Direction, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	// Figure out the network layer info.
 	var transProto uint8
 	var src tcpip.Address
@@ -380,7 +381,7 @@ func LogPacket(prefix string, dir Direction, protocol tcpip.NetworkProtocolNumbe
 
 // trimmedClone clones the packet buffer to not modify the original. It trims
 // anything before the network header.
-func trimmedClone(pkt stack.PacketBufferPtr) stack.PacketBufferPtr {
+func trimmedClone(pkt *stack.PacketBuffer) *stack.PacketBuffer {
 	// We don't clone the original packet buffer so that the new packet buffer
 	// does not have any of its headers set.
 	//

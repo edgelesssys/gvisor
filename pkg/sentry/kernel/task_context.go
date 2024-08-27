@@ -105,9 +105,11 @@ func (t *Task) contextValue(key any, isTaskGoroutine bool) any {
 		t.mountNamespace.IncRef()
 		return t.mountNamespace
 	case devutil.CtxDevGoferClient:
-		return t.k.getDevGoferClient(t.containerID)
+		return t.k.GetDevGoferClient(t.k.ContainerName(t.containerID))
 	case inet.CtxStack:
 		return t.NetworkContext()
+	case inet.CtxNamespaceByFD:
+		return t.NetworkNamespaceByFD
 	case ktime.CtxRealtimeClock:
 		return t.k.RealtimeClock()
 	case limits.CtxLimits:
@@ -120,8 +122,6 @@ func (t *Task) contextValue(key any, isTaskGoroutine bool) any {
 		return t.memCgID.Load()
 	case pgalloc.CtxMemoryFile:
 		return t.k.mf
-	case pgalloc.CtxMemoryFileProvider:
-		return t.k
 	case platform.CtxPlatform:
 		return t.k
 	case shm.CtxDeviceID:

@@ -86,6 +86,8 @@ type thread struct {
 	//
 	// These are used for the register set for system calls.
 	initRegs arch.Registers
+
+	logPrefix atomic.Pointer[string]
 }
 
 // requestThread is used to request a new sysmsg thread. A thread identifier will
@@ -99,15 +101,16 @@ type requestStub struct {
 	done chan *thread
 }
 
-// maxSysmsgThreads specifies the maximum number of system threads that a
-// subprocess can create in context decoupled mode.
-// TODO(b/268366549): Replace maxSystemThreads below.
-var maxSysmsgThreads = runtime.GOMAXPROCS(0)
+// maxSysmsgThreads is the maximum number of sysmsg threads that a subprocess
+// can create. It is based on GOMAXPROCS and set once, so it must be set after
+// GOMAXPROCS has been adjusted (see loader.go:Args.NumCPU).
+var maxSysmsgThreads = 0
+
+// maxChildThreads is the max number of all child system threads that a
+// subprocess can create, including sysmsg threads.
+var maxChildThreads = 0
 
 const (
-	// maxSystemThreads specifies the maximum number of system threads that a
-	// subprocess may create in order to process the contexts.
-	maxSystemThreads = 4096
 	// maxGuestContexts specifies the maximum number of task contexts that a
 	// subprocess can handle.
 	maxGuestContexts = 4095
@@ -133,8 +136,8 @@ type subprocess struct {
 	mu sync.Mutex
 
 	// faultedContexts is the set of contexts for which it's possible that
-	// context.lastFaultSP == this subprocess.
-	faultedContexts map[*context]struct{}
+	// platformContext.lastFaultSP == this subprocess.
+	faultedContexts map[*platformContext]struct{}
 
 	// sysmsgStackPool is a pool of available sysmsg stacks.
 	sysmsgStackPool pool.Pool
@@ -175,7 +178,22 @@ type subprocess struct {
 	dead atomicbitops.Bool
 }
 
-func (s *subprocess) initSyscallThread(ptraceThread *thread) error {
+var seccompNotifyIsSupported = false
+
+func initSeccompNotify() {
+	_, _, errno := unix.Syscall(seccomp.SYS_SECCOMP, linux.SECCOMP_SET_MODE_FILTER, linux.SECCOMP_FILTER_FLAG_NEW_LISTENER, 0)
+	switch errno {
+	case unix.EFAULT:
+		// seccomp unotify is supported.
+	case unix.EINVAL:
+		log.Warningf("Seccomp user-space notification mechanism isn't " +
+			"supported by the kernel (available since Linux 5.0).")
+	default:
+		panic(fmt.Sprintf("seccomp returns unexpected code: %d", errno))
+	}
+}
+
+func (s *subprocess) initSyscallThread(ptraceThread *thread, seccompNotify bool) error {
 	s.syscallThreadMu.Lock()
 	defer s.syscallThreadMu.Unlock()
 
@@ -190,7 +208,7 @@ func (s *subprocess) initSyscallThread(ptraceThread *thread) error {
 		thread:  ptraceThread,
 	}
 
-	if err := t.init(); err != nil {
+	if err := t.init(seccompNotify); err != nil {
 		panic(fmt.Sprintf("failed to create a syscall thread"))
 	}
 	s.syscallThread = &t
@@ -293,7 +311,13 @@ func (s *subprocess) handlePtraceSyscallRequest(req any) {
 // This will either be a newly created subprocess, or one from the global pool.
 // The create function will be called in the latter case, which is guaranteed
 // to happen with the runtime thread locked.
-func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFile) (*subprocess, error) {
+//
+// seccompNotify indicates a ways of comunications with syscall threads.
+// If it is false, futex-s are used. Otherwise, seccomp-unotify is used.
+// seccomp-unotify can't be used for the source pool process, because it is a
+// parent of all other stub processes, but only one filter can be installed
+// with SECCOMP_FILTER_FLAG_NEW_LISTENER.
+func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFile, seccompNotify bool) (*subprocess, error) {
 	if sp := globalPool.fetchAvailable(); sp != nil {
 		sp.subprocessRefs.InitRefs()
 		sp.usertrap = usertrap.New()
@@ -309,8 +333,8 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 	// Ready.
 	sp := &subprocess{
 		requests:          requests,
-		faultedContexts:   make(map[*context]struct{}),
-		sysmsgStackPool:   pool.Pool{Start: 0, Limit: maxSystemThreads},
+		faultedContexts:   make(map[*platformContext]struct{}),
+		sysmsgStackPool:   pool.Pool{Start: 0, Limit: uint64(maxChildThreads)},
 		threadContextPool: pool.Pool{Start: 0, Limit: maxGuestContexts},
 		memoryFile:        memoryFile,
 		sysmsgThreads:     make(map[uint32]*sysmsgThread),
@@ -326,7 +350,7 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 	}
 	sp.sysmsgInitRegs = ptraceThread.initRegs
 
-	if err := sp.initSyscallThread(ptraceThread); err != nil {
+	if err := sp.initSyscallThread(ptraceThread, seccompNotify); err != nil {
 		return nil, err
 	}
 
@@ -346,12 +370,15 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 	sp.mapSharedRegions()
 	sp.mapPrivateRegions()
 
-	// Create the initial sysmsg thread.
-	atomic.AddUint32(&sp.contextQueue.numThreadsToWakeup, 1)
-	if err := sp.createSysmsgThread(); err != nil {
-		return nil, err
+	// The main stub doesn't need sysmsg threads.
+	if seccompNotify {
+		// Create the initial sysmsg thread.
+		atomic.AddUint32(&sp.contextQueue.numThreadsToWakeup, 1)
+		if err := sp.createSysmsgThread(); err != nil {
+			return nil, err
+		}
+		sp.numSysmsgThreads++
 	}
-	sp.numSysmsgThreads++
 
 	return sp, nil
 }
@@ -467,6 +494,10 @@ func (s *subprocess) Release() {
 func (s *subprocess) release() {
 	if s.alive() {
 		globalPool.markAvailable(s)
+		return
+	}
+	if s.syscallThread != nil && s.syscallThread.seccompNotify != nil {
+		s.syscallThread.seccompNotify.Close()
 	}
 }
 
@@ -522,9 +553,28 @@ const (
 	killed
 )
 
+func (t *thread) loadLogPrefix() *string {
+	p := t.logPrefix.Load()
+	if p == nil {
+		prefix := fmt.Sprintf("[% 4d:% 4d] ", t.tgid, t.tid)
+		t.logPrefix.Store(&prefix)
+		p = &prefix
+	}
+	return p
+}
+
+// Debugf logs with the debugging severity.
 func (t *thread) Debugf(format string, v ...any) {
-	prefix := fmt.Sprintf("%8d:", t.tid)
-	log.DebugfAtDepth(1, prefix+format, v...)
+	if log.IsLogging(log.Debug) {
+		log.DebugfAtDepth(1, *t.loadLogPrefix()+format, v...)
+	}
+}
+
+// Warningf logs with the warning severity.
+func (t *thread) Warningf(format string, v ...any) {
+	if log.IsLogging(log.Warning) {
+		log.WarningfAtDepth(1, *t.loadLogPrefix()+format, v...)
+	}
 }
 
 func (t *thread) dumpAndPanic(message string) {
@@ -611,7 +661,12 @@ func (t *thread) wait(outcome waitOutcome) unix.Signal {
 	}
 }
 
-// destroy kills the thread.
+// kill kills the thread;
+func (t *thread) kill() {
+	unix.Tgkill(int(t.tgid), int(t.tid), unix.Signal(unix.SIGKILL))
+}
+
+// destroy kills and waits on the thread.
 //
 // Note that this should not be used in the general case; the death of threads
 // will typically cause the death of the parent. This is a utility method for
@@ -726,7 +781,7 @@ func (s *subprocess) decAwakeContexts() {
 // This function returns true on a system call, false on a signal.
 // The second return value is true if a syscall instruction can be replaced on
 // a function call.
-func (s *subprocess) switchToApp(c *context, ac *arch.Context64) (isSyscall bool, shouldPatchSyscall bool, err *platform.ContextError) {
+func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSyscall bool, shouldPatchSyscall bool, err *platform.ContextError) {
 	// Reset necessary registers.
 	regs := &ac.StateData().Regs
 	s.resetSysemuRegs(regs)
@@ -957,7 +1012,7 @@ func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
 	}
 }
 
-func (s *subprocess) PullFullState(c *context, ac *arch.Context64) error {
+func (s *subprocess) PullFullState(c *platformContext, ac *arch.Context64) error {
 	if !c.sharedContext.isActiveInSubprocess(s) {
 		panic("Attempted to PullFullState for context that is not used in subprocess")
 	}
@@ -1140,7 +1195,7 @@ func (s *subprocess) PostFork() {
 // activateContext activates the context in this subprocess.
 // No-op if the context is already active within the subprocess; if not,
 // deactivates it from its last subprocess.
-func (s *subprocess) activateContext(c *context) error {
+func (s *subprocess) activateContext(c *platformContext) error {
 	if !c.sharedContext.isActiveInSubprocess(s) {
 		c.sharedContext.release()
 		c.sharedContext = nil

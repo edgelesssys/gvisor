@@ -77,9 +77,10 @@ func setupNetwork(conn *urpc.Client, pid int, conf *config.Config) error {
 
 func createDefaultLoopbackInterface(conf *config.Config, conn *urpc.Client) error {
 	link := boot.DefaultLoopbackLink
-	link.GvisorGROTimeout = conf.GvisorGROTimeout
+	link.GVisorGRO = conf.GVisorGRO
 	if err := conn.Call(boot.NetworkCreateLinksAndRoutes, &boot.CreateLinksAndRoutesArgs{
 		LoopbackLinks: []boot.LoopbackLink{link},
+		DisconnectOk:  conf.NetDisconnectOk,
 	}, nil); err != nil {
 		return fmt.Errorf("creating loopback link and routes: %v", err)
 	}
@@ -102,17 +103,17 @@ func joinNetNS(nsPath string) (func(), error) {
 	}, nil
 }
 
-// isRootNS determines whether we are running in the root net namespace.
-// /proc/sys/net/core/rmem_default only exists in root network namespace.
-func isRootNS() (bool, error) {
-	err := unix.Access("/proc/sys/net/core/rmem_default", unix.F_OK)
+// isRootNetNS determines whether we are running in the root net namespace.
+// /proc/sys/net/core/dev_weight only exists in root network namespace.
+func isRootNetNS() (bool, error) {
+	err := unix.Access("/proc/sys/net/core/dev_weight", unix.F_OK)
 	switch err {
 	case nil:
 		return true, nil
 	case unix.ENOENT:
 		return false, nil
 	default:
-		return false, fmt.Errorf("failed to access /proc/sys/net/core/rmem_default: %v", err)
+		return false, fmt.Errorf("failed to access /proc/sys/net/core/dev_weight: %v", err)
 	}
 }
 
@@ -150,7 +151,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 		return fmt.Errorf("querying interfaces: %w", err)
 	}
 
-	isRoot, err := isRootNS()
+	isRoot, err := isRootNetNS()
 	if err != nil {
 		return err
 	}
@@ -159,7 +160,9 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 	}
 
 	// Collect addresses and routes from the interfaces.
-	var args boot.CreateLinksAndRoutesArgs
+	args := boot.CreateLinksAndRoutesArgs{
+		DisconnectOk: conf.NetDisconnectOk,
+	}
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 {
 			log.Infof("Skipping down interface: %+v", iface)
@@ -277,20 +280,21 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 				Neighbors:         neighbors,
 				LinkAddress:       linkAddress,
 				Addresses:         addresses,
-				GvisorGROTimeout:  conf.GvisorGROTimeout,
+				GVisorGRO:         conf.GVisorGRO,
 			})
 		} else {
 			link := boot.FDBasedLink{
-				Name:              iface.Name,
-				MTU:               iface.MTU,
-				Routes:            routes,
-				TXChecksumOffload: conf.TXChecksumOffload,
-				RXChecksumOffload: conf.RXChecksumOffload,
-				NumChannels:       conf.NumNetworkChannels,
-				QDisc:             conf.QDisc,
-				Neighbors:         neighbors,
-				LinkAddress:       linkAddress,
-				Addresses:         addresses,
+				Name:                 iface.Name,
+				MTU:                  iface.MTU,
+				Routes:               routes,
+				TXChecksumOffload:    conf.TXChecksumOffload,
+				RXChecksumOffload:    conf.RXChecksumOffload,
+				NumChannels:          conf.NumNetworkChannels,
+				ProcessorsPerChannel: conf.NetworkProcessorsPerChannel,
+				QDisc:                conf.QDisc,
+				Neighbors:            neighbors,
+				LinkAddress:          linkAddress,
+				Addresses:            addresses,
 			}
 
 			log.Debugf("Setting up network channels")
@@ -312,12 +316,12 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 				args.FilePayload.Files = append(args.FilePayload.Files, socketEntry.deviceFile)
 			}
 
-			if link.GSOMaxSize == 0 && conf.GvisorGSO {
+			if link.GSOMaxSize == 0 && conf.GVisorGSO {
 				// Host GSO is disabled. Let's enable gVisor GSO.
-				link.GSOMaxSize = stack.GvisorGSOMaxSize
-				link.GvisorGSOEnabled = true
+				link.GSOMaxSize = stack.GVisorGSOMaxSize
+				link.GVisorGSOEnabled = true
 			}
-			link.GvisorGROTimeout = conf.GvisorGROTimeout
+			link.GVisorGRO = conf.GVisorGRO
 
 			args.FDBasedLinks = append(args.FDBasedLinks, link)
 		}
@@ -429,8 +433,8 @@ func createSocket(iface net.Interface, ifaceLink netlink.Link, enableGSO bool) (
 // interface.
 func loopbackLink(conf *config.Config, iface net.Interface, addrs []net.Addr) (boot.LoopbackLink, error) {
 	link := boot.LoopbackLink{
-		Name:             iface.Name,
-		GvisorGROTimeout: conf.GvisorGROTimeout,
+		Name:      iface.Name,
+		GVisorGRO: conf.GVisorGRO,
 	}
 	for _, addr := range addrs {
 		ipNet, ok := addr.(*net.IPNet)
@@ -526,6 +530,9 @@ func removeAddress(source netlink.Link, ipAndMask string) error {
 }
 
 func pcapAndNAT(args *boot.CreateLinksAndRoutesArgs, conf *config.Config) error {
+	// Possibly enable packet logging.
+	args.LogPackets = conf.LogPackets
+
 	// Pass PCAP log file if present.
 	if conf.PCAP != "" {
 		args.PCAP = true

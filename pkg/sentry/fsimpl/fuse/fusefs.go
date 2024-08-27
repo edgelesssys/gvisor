@@ -53,7 +53,7 @@ type filesystemOptions struct {
 	// gid of the mount owner.
 	gid auth.KGID
 
-	// rootMode specifies the the file mode of the filesystem's root.
+	// rootMode specifies the file mode of the filesystem's root.
 	rootMode linux.FileMode
 
 	// maxActiveRequests specifies the maximum number of active requests that can
@@ -301,14 +301,31 @@ func (fs *filesystem) newRoot(ctx context.Context, creds *auth.Credentials, mode
 	return &d
 }
 
-func (fs *filesystem) newInode(ctx context.Context, nodeID uint64, attr linux.FUSEAttr) kernfs.Inode {
-	i := &inode{fs: fs, nodeID: nodeID}
-	creds := auth.Credentials{EffectiveKGID: auth.KGID(attr.UID), EffectiveKUID: auth.KUID(attr.UID)}
+func (fs *filesystem) newInode(ctx context.Context, out linux.FUSEEntryOut) (kernfs.Inode, error) {
+	attr := out.Attr
+	if !isValidType(attr.Mode) {
+		return nil, linuxerr.EIO
+	}
+	i := &inode{fs: fs, nodeID: out.NodeID, generation: out.Generation}
 	i.attrMu.Lock()
-	i.init(&creds, linux.UNNAMED_MAJOR, fs.devMinor, nodeID, linux.FileMode(attr.Mode), attr.Nlink)
-	i.size.Store(attr.Size)
-	i.attrMu.Unlock()
+	defer i.attrMu.Unlock()
+
+	creds := auth.Credentials{EffectiveKGID: auth.KGID(attr.UID), EffectiveKUID: auth.KUID(attr.UID)}
+	i.init(&creds, linux.UNNAMED_MAJOR, fs.devMinor, out.NodeID, linux.FileMode(attr.Mode), attr.Nlink)
+	i.updateAttrs(attr, int64(out.AttrValid), int64(out.AttrValidNSec))
+	i.updateEntryTime(int64(out.EntryValid), int64(out.EntryValidNSec))
+
 	i.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	i.InitRefs()
-	return i
+	return i, nil
+}
+
+// isValidType is analogous to fs/fuse/dir.c:fuse_valid_type().
+func isValidType(mode uint32) bool {
+	switch mode & linux.S_IFMT {
+	case linux.S_IFREG, linux.S_IFDIR, linux.S_IFLNK, linux.S_IFCHR, linux.S_IFBLK, linux.S_IFIFO, linux.S_IFSOCK:
+		return true
+	default:
+		return false
+	}
 }

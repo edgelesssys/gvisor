@@ -24,7 +24,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
@@ -122,13 +121,12 @@ type Config struct {
 	// HostGSO indicates that host segmentation offload is enabled.
 	HostGSO bool `flag:"gso"`
 
-	// GvisorGSO indicates that gVisor segmentation offload is enabled. The flag
+	// GVisorGSO indicates that gVisor segmentation offload is enabled. The flag
 	// retains its old name of "software" GSO for API consistency.
-	GvisorGSO bool `flag:"software-gso"`
+	GVisorGSO bool `flag:"software-gso"`
 
-	// GvisorGROTimeout sets gVisor's generic receive offload timeout. Zero
-	// bypasses GRO.
-	GvisorGROTimeout time.Duration `flag:"gvisor-gro"`
+	// GVisorGRO enables gVisor's generic receive offload.
+	GVisorGRO bool `flag:"gvisor-gro"`
 
 	// TXChecksumOffload indicates that TX Checksum Offload is enabled.
 	TXChecksumOffload bool `flag:"tx-checksum-offload"`
@@ -236,13 +234,16 @@ type Config struct {
 	// for the duration of the container execution.
 	TraceFile string `flag:"trace"`
 
-	// RestoreFile is the path to the saved container image.
-	RestoreFile string
-
 	// NumNetworkChannels controls the number of AF_PACKET sockets that map
 	// to the same underlying network device. This allows netstack to better
 	// scale for high throughput use cases.
 	NumNetworkChannels int `flag:"num-network-channels"`
+
+	// NetworkProcessorsPerChannel controls the number of goroutines used to
+	// handle packets on a single network channel. A higher number can help handle
+	// many simultaneous connections. If this is 0, runsc will divide GOMAXPROCS
+	// evenly among each network channel.
+	NetworkProcessorsPerChannel int `flag:"network-processors-per-channel"`
 
 	// Rootless allows the sandbox to be started with a user that is not root.
 	// Defense in depth measures are weaker in rootless mode. Specifically, the
@@ -294,7 +295,7 @@ type Config struct {
 	// each.
 	FDLimit int `flag:"fdlimit"`
 
-	// DCache sets the global dirent cache size. If zero, per-mount caches are
+	// DCache sets the global dirent cache size. If negative, per-mount caches are
 	// used.
 	DCache int `flag:"dcache"`
 
@@ -307,6 +308,9 @@ type Config struct {
 	// exists, but is mostly idle. Not supported in rootless mode.
 	DirectFS bool `flag:"directfs"`
 
+	// AppHugePages enables support for application huge pages.
+	AppHugePages bool `flag:"app-huge-pages"`
+
 	// NVProxy enables support for Nvidia GPUs.
 	NVProxy bool `flag:"nvproxy"`
 
@@ -314,6 +318,12 @@ type Config struct {
 	// `docker run --gpus` directly. For backward compatibility, this has the
 	// effect of injecting nvidia-container-runtime-hook as a prestart hook.
 	NVProxyDocker bool `flag:"nvproxy-docker"`
+
+	// NVProxyDriverVersion is the version of the NVIDIA driver ABI to use.
+	// If empty, it is autodetected from the installed NVIDIA driver.
+	// It can also be set to the special value "latest" to force the use of
+	// the latest supported NVIDIA driver ABI.
+	NVProxyDriverVersion string `flag:"nvproxy-driver-version"`
 
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
@@ -349,9 +359,17 @@ type Config struct {
 	// present, and reproduce them in the sandbox.
 	ReproduceNftables bool `flag:"reproduce-nftables"`
 
+	// NetDisconnectOk indicates whether the link endpoint capability
+	// CapabilityDisconnectOk should be set. This allows open connections to be
+	// disconnected upon save.
+	NetDisconnectOk bool `flag:"net-disconnect-ok"`
+
 	// TestOnlyAutosaveImagePath if not empty enables auto save for syscall tests
 	// and stores the directory path to the saved state file.
 	TestOnlyAutosaveImagePath string `flag:"TESTONLY-autosave-image-path"`
+
+	// TestOnlyAutosaveResume indicates save resume for syscall tests.
+	TestOnlyAutosaveResume bool `flag:"TESTONLY-autosave-resume"`
 }
 
 func (c *Config) validate() error {
@@ -404,9 +422,15 @@ func (c *Config) Log() {
 		st := obj.Type()
 		for i := 0; i < st.NumField(); i++ {
 			f := st.Field(i)
-			val := obj.Field(i).String()
-			if val == "" {
+			var val any
+			if strVal := obj.Field(i).String(); strVal == "" {
 				val = "(empty)"
+			} else if !f.IsExported() {
+				// Cannot convert to `interface{}` for non-exported fields,
+				// so just use `strVal`.
+				val = fmt.Sprintf("%s (unexported)", strVal)
+			} else {
+				val = obj.Field(i).Interface()
 			}
 			if flagName, hasFlag := f.Tag.Lookup("flag"); hasFlag {
 				log.Debugf("Config.%s (--%s): %v", f.Name, flagName, val)

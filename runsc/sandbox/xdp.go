@@ -114,7 +114,9 @@ func prepareRedirectInterfaceArgs(bind boot.BindOpt, conf *config.Config) (boot.
 		return boot.CreateLinksAndRoutesArgs{}, net.Interface{}, fmt.Errorf("querying interfaces: %w", err)
 	}
 
-	var args boot.CreateLinksAndRoutesArgs
+	args := boot.CreateLinksAndRoutesArgs{
+		DisconnectOk: conf.NetDisconnectOk,
+	}
 	var netIface net.Interface
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 {
@@ -216,7 +218,7 @@ func prepareRedirectInterfaceArgs(bind boot.BindOpt, conf *config.Config) (boot.
 			Neighbors:         neighbors,
 			LinkAddress:       linkAddress,
 			Addresses:         []boot.IPWithPrefix{addr},
-			GvisorGROTimeout:  conf.GvisorGROTimeout,
+			GVisorGRO:         conf.GVisorGRO,
 			Bind:              bind,
 		}
 		args.XDPLinks = append(args.XDPLinks, xdplink)

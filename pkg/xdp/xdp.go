@@ -26,7 +26,7 @@
 //     with an incoming packet. The packet is filled by the kernel, which
 //     places a descriptor to the same UMEM area in the RX queue, signifying
 //     that userspace may read the packet.
-//   - Trasmit: Userspace adds a descriptor to TX queue. The kernel
+//   - Transmit: Userspace adds a descriptor to TX queue. The kernel
 //     sends the packet (stored in UMEM) pointed to by the descriptor.
 //     Upon completion, the kernel places a descriptor in the completion
 //     queue to notify userspace that the packet is sent and the UMEM
@@ -153,9 +153,9 @@ func NewFromSocket(sockfd int, ifaceIdx, queueID uint32, opts Opts) (*ControlBlo
 	}
 
 	reg := unix.XDPUmemReg{
-		Addr: uint64(sliceBackingPointer(umemMemory)),
-		Len:  uint64(len(umemMemory)),
-		Size: opts.FrameSize,
+		Addr:       uint64(sliceBackingPointer(umemMemory)),
+		Len:        uint64(len(umemMemory)),
+		Chunk_size: opts.FrameSize,
 		// Not useful in the RX path.
 		Headroom: 0,
 		// TODO(b/240191988): Investigate use of SHARED flag.

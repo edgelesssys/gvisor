@@ -893,7 +893,7 @@ func (vfs *VirtualFilesystem) disconnectLocked(mnt *Mount) VirtualDentry {
 		delete(mnt.ns.mountpoints, vd.dentry)
 	}
 	vfs.mounts.removeSeqed(mnt)
-	mnt.loadKey(VirtualDentry{}) // Clear mnt.key.
+	mnt.setKey(VirtualDentry{}) // Clear mnt.key.
 	vfsmpmounts := vfs.mountpoints[vd.dentry]
 	delete(vfsmpmounts, mnt)
 	if len(vfsmpmounts) == 0 {
@@ -1370,7 +1370,7 @@ func (vfs *VirtualFilesystem) GenerateProcMounts(ctx context.Context, taskRootDi
 		if err != nil {
 			// For some reason we didn't get a path. Log a warning
 			// and run with empty path.
-			ctx.Warningf("VFS.GenerateProcMounts: error getting pathname for mount root %+v: %v", mnt.root, err)
+			ctx.Warningf("VFS.GenerateProcMounts: error getting pathname for mount root: %v", err)
 			path = ""
 		}
 		if path == "" {
@@ -1437,7 +1437,7 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 		if err != nil {
 			// For some reason we didn't get a path. Log a warning
 			// and run with empty path.
-			ctx.Warningf("VFS.GenerateProcMountInfo: error getting pathname for mount root %+v: %v", mnt.root, err)
+			ctx.Warningf("VFS.GenerateProcMountInfo: error getting pathname for mount root: %v", err)
 			continue
 		}
 		if pathFromRoot == "" {
@@ -1449,7 +1449,7 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 		if err != nil {
 			// For some reason we didn't get a path. Log a warning
 			// and run with empty path.
-			ctx.Warningf("VFS.GenerateProcMountInfo: error getting pathname for mount root %+v: %v", mnt.root, err)
+			ctx.Warningf("VFS.GenerateProcMountInfo: error getting pathname for mount root: %v", err)
 			continue
 		}
 		if pathFromFS == "" {
@@ -1464,7 +1464,7 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 		statx, err := vfs.StatAt(ctx, creds, pop, &StatOptions{})
 		if err != nil {
 			// Well that's not good. Ignore this mount.
-			ctx.Warningf("VFS.GenerateProcMountInfo: failed to stat mount root %+v: %v", mnt.root, err)
+			ctx.Warningf("VFS.GenerateProcMountInfo: failed to stat mount root: %v", err)
 			continue
 		}
 
@@ -1532,7 +1532,7 @@ func manglePath(p string) string {
 	return r.Replace(p)
 }
 
-// superBlockOpts returns the super block options string for the the mount at
+// superBlockOpts returns the super block options string for the mount at
 // the given path.
 func superBlockOpts(mountPath string, mnt *Mount) string {
 	// Compose super block options by combining global mount flags with
@@ -1569,7 +1569,7 @@ func superBlockOpts(mountPath string, mnt *Mount) string {
 func (vfs *VirtualFilesystem) generateOptionalTags(ctx context.Context, mnt *Mount, root VirtualDentry) string {
 	vfs.lockMounts()
 	defer vfs.unlockMounts(ctx)
-	// TODO(b/249777195): Support MS_UNBINDABLE propagation type.
+	// TODO(b/305893463): Support MS_UNBINDABLE propagation type.
 	var optionalSb strings.Builder
 	if mnt.isShared {
 		optionalSb.WriteString(fmt.Sprintf("shared:%d ", mnt.groupID))

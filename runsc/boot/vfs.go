@@ -20,6 +20,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,10 +36,10 @@ import (
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/devices/accel"
 	"gvisor.dev/gvisor/pkg/sentry/devices/memdev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy"
+	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy/vfio"
 	"gvisor.dev/gvisor/pkg/sentry/devices/ttydev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/tundev"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroupfs"
@@ -71,11 +72,6 @@ const (
 
 // SelfFilestorePrefix is the prefix of the self filestore file name.
 const SelfFilestorePrefix = ".gvisor.filestore."
-
-const (
-	pciPathGlobTPUv4 = "/sys/devices/pci0000:00/*/accel/accel*"
-	pciPathGlobTPUv5 = "/sys/devices/pci0000:00/*/vfio-dev/vfio*"
-)
 
 // SelfFilestorePath returns the path at which the self filestore file is
 // stored for a given mount.
@@ -339,7 +335,7 @@ func parseMountOption(opt string, allowedKeys ...string) (bool, error) {
 	if len(kv) > 2 {
 		return false, fmt.Errorf("invalid option %q", opt)
 	}
-	return specutils.ContainsStr(allowedKeys, kv[0]), nil
+	return slices.Contains(allowedKeys, kv[0]), nil
 }
 
 type fdDispenser struct {
@@ -423,7 +419,7 @@ func newContainerMounter(info *containerInfo, k *kernel.Kernel, hints *PodMountH
 		hints:             hints,
 		sharedMounts:      sharedMounts,
 		productName:       productName,
-		containerID:       info.procArgs.ContainerID,
+		containerID:       info.cid,
 		sandboxID:         sandboxID,
 		containerName:     info.containerName,
 	}
@@ -637,12 +633,11 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 	}
 	if filestoreFD != nil {
 		// Create memory file for disk-backed overlays.
-		mf, err := createPrivateMemoryFile(filestoreFD.ReleaseToFile("overlay-filestore"))
+		mf, err := createPrivateMemoryFile(filestoreFD.ReleaseToFile("overlay-filestore"), vfs.RestoreID{ContainerName: c.containerName, Path: dst})
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create memory file for overlay: %v", err)
 		}
 		tmpfsOpts.MemoryFile = mf
-		tmpfsOpts.UniqueID = vfs.RestoreID{ContainerName: c.containerName, Path: dst}
 	}
 	upperOpts.GetFilesystemOptions.InternalData = tmpfsOpts
 	upper, err := c.k.VFS().MountDisconnected(ctx, creds, "" /* source */, tmpfs.Name, &upperOpts)
@@ -783,7 +778,7 @@ type mountInfo struct {
 func (c *containerMounter) prepareMounts() ([]mountInfo, error) {
 	// If device gofer exists, connect to it.
 	if c.devGoferFD != nil {
-		if err := c.k.AddDevGofer(c.containerID, c.devGoferFD.Release()); err != nil {
+		if err := c.k.AddDevGofer(c.containerName, c.devGoferFD.Release()); err != nil {
 			return nil, err
 		}
 	}
@@ -877,11 +872,14 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 
 	// Find filesystem name and FS specific data field.
 	switch m.mount.Type {
-	case devpts.Name, dev.Name, proc.Name:
+	case devpts.Name, dev.Name:
 		// Nothing to do.
 
 	case Nonefs:
 		fsName = sys.Name
+
+	case proc.Name:
+		internalData = newProcInternalData(spec)
 
 	case sys.Name:
 		sysData := &sys.InternalData{EnableTPUProxyPaths: specutils.TPUProxyIsEnabled(spec, conf)}
@@ -897,13 +895,12 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 			return "", nil, err
 		}
 		if m.filestoreFD != nil {
-			mf, err := createPrivateMemoryFile(m.filestoreFD.ReleaseToFile("tmpfs-filestore"))
+			mf, err := createPrivateMemoryFile(m.filestoreFD.ReleaseToFile("tmpfs-filestore"), vfs.RestoreID{ContainerName: containerName, Path: m.mount.Destination})
 			if err != nil {
 				return "", nil, fmt.Errorf("failed to create memory file for tmpfs: %v", err)
 			}
 			internalData = tmpfs.FilesystemOpts{
 				MemoryFile: mf,
-				UniqueID:   vfs.RestoreID{ContainerName: containerName, Path: m.mount.Destination},
 				// If a mount is being overlaid with tmpfs, it should not be limited by
 				// the default tmpfs size limit.
 				DisableDefaultSizeLimit: true,
@@ -986,7 +983,7 @@ func parseKeyValue(s string) (string, string, bool) {
 	return strings.TrimSpace(tokens[0]), strings.TrimSpace(tokens[1]), true
 }
 
-func createPrivateMemoryFile(file *os.File) (*pgalloc.MemoryFile, error) {
+func createPrivateMemoryFile(file *os.File, restoreID vfs.RestoreID) (*pgalloc.MemoryFile, error) {
 	mfOpts := pgalloc.MemoryFileOpts{
 		// Private memory files are usually backed by files on disk. Ideally we
 		// would confirm with fstatfs(2) but that is prohibited by seccomp.
@@ -997,6 +994,8 @@ func createPrivateMemoryFile(file *os.File) (*pgalloc.MemoryFile, error) {
 		// pgalloc.IMAWorkAroundForMemFile() uses. Users of private memory files
 		// are expected to have performed the work around outside the sandbox.
 		DisableIMAWorkAround: true,
+		// Private memory files need to be restored correctly using this ID.
+		RestoreID: restoreID.String(),
 	}
 	return pgalloc.NewMemoryFile(file, mfOpts)
 }
@@ -1266,26 +1265,23 @@ func (c *containerMounter) makeMountPoint(ctx context.Context, creds *auth.Crede
 
 // configureRestore returns an updated context.Context including filesystem
 // state used by restore defined by conf.
-func (c *containerMounter) configureRestore(ctx context.Context) (context.Context, error) {
+func (c *containerMounter) configureRestore(fdmap map[vfs.RestoreID]int, mfmap map[string]*pgalloc.MemoryFile) error {
 	// Compare createMountNamespace(); rootfs always consumes a gofer FD and a
 	// filestore FD is consumed if the rootfs GoferMountConf indicates so.
-	fdmap := make(map[vfs.RestoreID]int)
-
 	rootKey := vfs.RestoreID{ContainerName: c.containerName, Path: "/"}
 	fdmap[rootKey] = c.goferFDs.remove()
 
-	mfmap := make(map[vfs.RestoreID]*pgalloc.MemoryFile)
 	if rootfsConf := c.goferMountConfs[0]; rootfsConf.IsFilestorePresent() {
-		mf, err := createPrivateMemoryFile(c.goferFilestoreFDs.removeAsFD().ReleaseToFile("overlay-filestore"))
+		mf, err := createPrivateMemoryFile(c.goferFilestoreFDs.removeAsFD().ReleaseToFile("overlay-filestore"), rootKey)
 		if err != nil {
-			return ctx, fmt.Errorf("failed to create private memory file for mount rootfs: %w", err)
+			return fmt.Errorf("failed to create private memory file for mount rootfs: %w", err)
 		}
-		mfmap[rootKey] = mf
+		mfmap[rootKey.String()] = mf
 	}
 	// prepareMounts() consumes the remaining FDs for submounts.
 	mounts, err := c.prepareMounts()
 	if err != nil {
-		return ctx, err
+		return err
 	}
 	for i := range mounts {
 		submount := &mounts[i]
@@ -1294,15 +1290,15 @@ func (c *containerMounter) configureRestore(ctx context.Context) (context.Contex
 			fdmap[key] = submount.goferFD.Release()
 		}
 		if submount.filestoreFD != nil {
-			mf, err := createPrivateMemoryFile(submount.filestoreFD.ReleaseToFile("overlay-filestore"))
-			if err != nil {
-				return ctx, fmt.Errorf("failed to create private memory file for mount %q: %w", submount.mount.Destination, err)
-			}
 			key := vfs.RestoreID{ContainerName: c.containerName, Path: submount.mount.Destination}
-			mfmap[key] = mf
+			mf, err := createPrivateMemoryFile(submount.filestoreFD.ReleaseToFile("overlay-filestore"), key)
+			if err != nil {
+				return fmt.Errorf("failed to create private memory file for mount %q: %w", submount.mount.Destination, err)
+			}
+			mfmap[key.String()] = mf
 		}
 	}
-	return context.WithValue(context.WithValue(ctx, vfs.CtxRestoreFilesystemFDMap, fdmap), vfs.CtxFilesystemMemoryFileMap, mfmap), nil
+	return nil
 }
 
 func createDeviceFiles(ctx context.Context, creds *auth.Credentials, info *containerInfo, vfsObj *vfs.VirtualFilesystem, root vfs.VirtualDentry) error {
@@ -1379,59 +1375,21 @@ func createDeviceFile(ctx context.Context, creds *auth.Credentials, info *contai
 	return dev.CreateDeviceFile(ctx, vfsObj, creds, root, devSpec.Path, major, minor, mode, devSpec.UID, devSpec.GID)
 }
 
-// registerTPUDevice registers a TPU device in vfsObj based on the given device ID.
-func registerTPUDevice(vfsObj *vfs.VirtualFilesystem, minor uint32, deviceID int64) error {
-	switch deviceID {
-	case tpu.TPUV4DeviceID, tpu.TPUV4liteDeviceID:
-		return accel.RegisterTPUDevice(vfsObj, minor, deviceID == tpu.TPUV4liteDeviceID)
-	case tpu.TPUV5eDeviceID:
-		return tpuproxy.RegisterTPUDevice(vfsObj, minor)
-	default:
-		return fmt.Errorf("unsupported TPU device with ID: 0x%x", deviceID)
-	}
-}
-
-// pathGlobToPathRegex is a map that points a TPU PCI path glob to its path regex.
-// TPU v4 devices are accessible via /sys/devices/pci0000:00/<pci_address>/accel/accel# on the host.
-// TPU v5 devices are accessible via at /sys/devices/pci0000:00/<pci_address>/vfio-dev/vfio# on the host.
-var pathGlobToPathRegex = map[string]string{
-	pciPathGlobTPUv4: `^/sys/devices/pci0000:00/\d+:\d+:\d+\.\d+/accel/accel(\d+)$`,
-	pciPathGlobTPUv5: `^/sys/devices/pci0000:00/\d+:\d+:\d+\.\d+/vfio-dev/vfio(\d+)$`,
-}
-
 func tpuProxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem) error {
 	if !specutils.TPUProxyIsEnabled(info.spec, info.conf) {
 		return nil
 	}
-	// Enumerate all potential PCI paths where TPU devices are available and register the found TPU devices.
-	for pciPathGlobal, pathRegex := range pathGlobToPathRegex {
-		pciAddrs, err := filepath.Glob(pciPathGlobal)
-		if err != nil {
-			return fmt.Errorf("enumerating PCI device files: %w", err)
-		}
-		pciPathRegex := regexp.MustCompile(pathRegex)
-		for _, pciPath := range pciAddrs {
-			ms := pciPathRegex.FindStringSubmatch(pciPath)
-			if ms == nil {
-				continue
-			}
-			deviceNum, err := strconv.ParseUint(ms[1], 10, 32)
-			if err != nil {
-				return fmt.Errorf("parsing PCI device number: %w", err)
-			}
-			var deviceIDBytes []byte
-			if deviceIDBytes, err = os.ReadFile(path.Join(pciPath, "device/device")); err != nil {
-				return fmt.Errorf("reading PCI device ID: %w", err)
-			}
-			deviceIDStr := strings.Replace(string(deviceIDBytes), "0x", "", -1)
-			deviceID, err := strconv.ParseInt(strings.TrimSpace(deviceIDStr), 16, 64)
-			if err != nil {
-				return fmt.Errorf("parsing PCI device ID: %w", err)
-			}
-			if err := registerTPUDevice(vfsObj, uint32(deviceNum), deviceID); err != nil {
-				return fmt.Errorf("registering TPU driver: %w", err)
-			}
-		}
+	allowedTPUDeviceIDs := map[int64]any{
+		tpu.TPUV4DeviceID:     nil,
+		tpu.TPUV4liteDeviceID: nil,
+		tpu.TPUV5pDeviceID:    nil,
+		tpu.TPUV5eDeviceID:    nil,
+	}
+	if err := tpuproxy.RegisterHostTPUDevices(vfsObj, allowedTPUDeviceIDs); err != nil {
+		return fmt.Errorf("registering host TPU devices: %w", err)
+	}
+	if err := vfio.RegisterVFIODevice(vfsObj); err != nil {
+		return fmt.Errorf("registering vfio driver: %w", err)
 	}
 	return nil
 }

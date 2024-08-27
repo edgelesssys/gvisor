@@ -192,6 +192,13 @@ func (ts *TaskSet) Kill(ws linux.WaitStatus) {
 	}
 }
 
+// IsExiting returns true if all tasks in ts are exiting or have exited.
+func (ts *TaskSet) IsExiting() bool {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return ts.Root.exiting
+}
+
 // advanceExitStateLocked checks that t's current exit state is oldExit, then
 // sets it to newExit. If t's current exit state is not oldExit,
 // advanceExitStateLocked panics.
@@ -1111,7 +1118,7 @@ func (t *Task) waitCollectZombieLocked(target *Task, opts *WaitOptions, asPtrace
 	// will be reaped here.
 	if tracer := target.Tracer(); tracer != nil && tracer.tg == t.tg && target.exitTracerNotified {
 		target.exitTracerAcked = true
-		target.ptraceTracer.Store((*Task)(nil))
+		target.ptraceTracer.Store(nil)
 		delete(t.ptraceTracees, target)
 	}
 	if target.parent != nil && target.parent.tg == t.tg && target.exitParentNotified {

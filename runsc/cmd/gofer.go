@@ -30,6 +30,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy/vfio"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
@@ -243,6 +244,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		UDSOpenEnabled:   conf.GetHostUDS().AllowOpen(),
 		UDSCreateEnabled: conf.GetHostUDS().AllowCreate(),
 		ProfileEnabled:   len(profileOpts) > 0,
+		DirectFS:         conf.DirectFS,
 	}
 	if err := filter.Install(opts); err != nil {
 		util.Fatalf("installing seccomp filters: %v", err)
@@ -538,13 +540,19 @@ func shouldExposeNvidiaDevice(path string) bool {
 	return nvidiaDevPathReg.MatchString(path)
 }
 
+// shouldExposeVfioDevice returns true if path refers to an VFIO device
+// which shuold be exposed to the container.
+func shouldExposeVFIODevice(path string) bool {
+	return strings.HasPrefix(path, filepath.Dir(vfio.VFIOPath))
+}
+
 // shouldExposeTpuDevice returns true if path refers to a TPU device which
 // should be exposed to the container.
 //
 // Precondition: tpuproxy is enabled.
 func shouldExposeTpuDevice(path string) bool {
-	_, valid, _ := util.ExtractTpuDeviceMinor(path)
-	return valid
+	_, valid, _ := util.ExtractTPUDeviceMinor(path)
+	return valid || shouldExposeVFIODevice(path)
 }
 
 func (g *Gofer) setupDev(spec *specs.Spec, conf *config.Config, root, procPath string) error {
@@ -678,12 +686,12 @@ func adjustMountOptions(conf *config.Config, path string, opts []string) ([]stri
 	switch statfs.Type {
 	case unix.OVERLAYFS_SUPER_MAGIC:
 		rv = append(rv, "overlayfs_stale_read")
-	case unix.NFS_SUPER_MAGIC:
+	case unix.NFS_SUPER_MAGIC, unix.FUSE_SUPER_MAGIC:
 		// The gofer client implements remote file handle sharing for performance.
-		// However, remote filesystems like NFS rely on close(2) syscall for
-		// flushing file data to the server. Such handle sharing prevents the
+		// However, remote filesystems like NFS and FUSE rely on close(2) syscall
+		// for flushing file data to the server. Such handle sharing prevents the
 		// application's close(2) syscall from being propagated to the host. Hence
-		// disable file handle sharing, so NFS files are flushed correctly.
+		// disable file handle sharing, so remote files are flushed correctly.
 		rv = append(rv, "disable_file_handle_sharing")
 	}
 	return rv, nil
@@ -692,7 +700,7 @@ func adjustMountOptions(conf *config.Config, path string, opts []string) ([]stri
 // setFlags sets sync FD flags on the given FlagSet.
 func (g *goferSyncFDs) setFlags(f *flag.FlagSet) {
 	f.IntVar(&g.nvproxyFD, "sync-nvproxy-fd", -1, "file descriptor that the gofer waits on until nvproxy setup is done")
-	f.IntVar(&g.usernsFD, "sync-userns-fd", -1, "file descriptor the the gofer waits on until userns mappings are set up")
+	f.IntVar(&g.usernsFD, "sync-userns-fd", -1, "file descriptor the gofer waits on until userns mappings are set up")
 	f.IntVar(&g.procMountFD, "proc-mount-sync-fd", -1, "file descriptor that the gofer writes to when /proc isn't needed anymore and can be unmounted")
 }
 

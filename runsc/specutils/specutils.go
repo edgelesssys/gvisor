@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy/vfio"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -43,10 +44,14 @@ import (
 const (
 	annotationFlagPrefix            = "dev.gvisor.flag."
 	annotationSeccomp               = "dev.gvisor.internal.seccomp."
-	annotationTPU                   = "dev.gvisor.internal.tpuproxy"
 	annotationSeccompRuntimeDefault = "RuntimeDefault"
 
 	annotationContainerName = "io.kubernetes.cri.container-name"
+)
+
+const (
+	// AnnotationTPU is the annotation used to enable TPU proxy on a pod.
+	AnnotationTPU = "dev.gvisor.internal.tpuproxy"
 )
 
 // ExePath must point to runsc binary, which is normally the same binary. It's
@@ -253,7 +258,7 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 			}
 		} else if len(containerName) > 0 {
 			// If we know the container name, then check to see if seccomp
-			// instructions were given to the the container.
+			// instructions were given to the container.
 			if annotation == annotationSeccomp+containerName && val == annotationSeccompRuntimeDefault {
 				// Container seccomp rules are redundant when using gVisor, so remove
 				// them when seccomp is set to RuntimeDefault.
@@ -523,12 +528,12 @@ func WaitForReady(pid int, timeout time.Duration, ready func() (bool, error)) er
 //     <yyyymmdd-hhmmss.uuuuuu>
 //   - %COMMAND%: is replaced with 'command'
 //   - %TEST%: is replaced with 'test' (omitted by default)
-func DebugLogFile(logPattern, command, test string) (*os.File, error) {
+func DebugLogFile(logPattern, command, test string, timestamp time.Time) (*os.File, error) {
 	if strings.HasSuffix(logPattern, "/") {
 		// Default format: <debug-log>/runsc.log.<yyyymmdd-hhmmss.uuuuuu>.<command>.txt
 		logPattern += "runsc.log.%TIMESTAMP%.%COMMAND%.txt"
 	}
-	logPattern = strings.Replace(logPattern, "%TIMESTAMP%", time.Now().Format("20060102-150405.000000"), -1)
+	logPattern = strings.Replace(logPattern, "%TIMESTAMP%", timestamp.Format("20060102-150405.000000"), -1)
 	logPattern = strings.Replace(logPattern, "%COMMAND%", command, -1)
 	logPattern = strings.Replace(logPattern, "%TEST%", test, -1)
 
@@ -566,15 +571,20 @@ func TPUProxyIsEnabled(spec *specs.Spec, conf *config.Config) bool {
 	if conf.TPUProxy {
 		return true
 	}
-	val, ok := spec.Annotations[annotationTPU]
-	if !ok {
-		return false
-	}
-	ret, err := strconv.ParseBool(val)
-	if err != nil {
-		log.Warningf("tpuproxy annotation set to invalid value %q: %w. Skipping.", val, err)
-	}
-	return ret
+	return AnnotationToBool(spec, AnnotationTPU)
+}
+
+// VFIOFunctionalityRequested returns true if the container should have access
+// to VFIO functionality.
+func VFIOFunctionalityRequested(dev *specs.LinuxDevice) bool {
+	return strings.HasPrefix(dev.Path, filepath.Dir(vfio.VFIOPath))
+}
+
+// AcceleratorFunctionalityRequested returns true if the container should have
+// access to compute accelerators. Compute accelerators are different from GPUs
+// by using a different major number and different device char files.
+func AcceleratorFunctionalityRequested(dev *specs.LinuxDevice) bool {
+	return strings.HasPrefix(dev.Path, "/dev/accel")
 }
 
 // TPUFunctionalityRequested returns true if the container should have access
@@ -585,7 +595,7 @@ func TPUFunctionalityRequested(spec *specs.Spec, conf *config.Config) bool {
 	}
 	if spec.Linux != nil {
 		for _, dev := range spec.Linux.Devices {
-			if strings.HasPrefix(dev.Path, "/dev/accel") {
+			if AcceleratorFunctionalityRequested(&dev) || VFIOFunctionalityRequested(&dev) {
 				return true
 			}
 		}
@@ -673,16 +683,6 @@ func SafeMount(src, dst, fstype string, flags uintptr, data, procPath string) er
 	return unix.Mount(src, safePath, fstype, flags, data)
 }
 
-// ContainsStr returns true if 'str' is inside 'strs'.
-func ContainsStr(strs []string, str string) bool {
-	for _, s := range strs {
-		if s == str {
-			return true
-		}
-	}
-	return false
-}
-
 // RetryEintr retries the function until an error different than EINTR is
 // returned.
 func RetryEintr(f func() (uintptr, uintptr, error)) (uintptr, uintptr, error) {
@@ -755,4 +755,19 @@ func FaqErrorMsg(anchor, msg string) string {
 // if no annotation is found.
 func ContainerName(spec *specs.Spec) string {
 	return spec.Annotations[annotationContainerName]
+}
+
+// AnnotationToBool parses the annotation value as a bool. On failure, it logs a warning and
+// returns false.
+func AnnotationToBool(spec *specs.Spec, annotation string) bool {
+	val, ok := spec.Annotations[annotation]
+	if !ok {
+		return false
+	}
+	ret, err := strconv.ParseBool(val)
+	if err != nil {
+		log.Warningf("Failed to parse annotation %q=%q as a bool: %v", annotation, val, err)
+		return false
+	}
+	return ret
 }
