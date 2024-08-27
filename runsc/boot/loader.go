@@ -36,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/memutil"
+	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/control"
@@ -62,7 +63,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
 	"gvisor.dev/gvisor/pkg/tcpip/link/loopback"
-	"gvisor.dev/gvisor/pkg/tcpip/link/packetsocket"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sniffer"
 	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -90,6 +90,21 @@ import (
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/route"
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/uevent"
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/unix"
+)
+
+// ContainerRuntimeState is the runtime state of a container.
+type ContainerRuntimeState int
+
+const (
+	// RuntimeStateInvalid used just in case of error.
+	RuntimeStateInvalid ContainerRuntimeState = iota
+	// RuntimeStateCreating indicates that the container is being
+	// created, but has not started running yet.
+	RuntimeStateCreating
+	// RuntimeStateRunning indicates that the container is running.
+	RuntimeStateRunning
+	// RuntimeStateStopped indicates that the container has stopped.
+	RuntimeStateStopped
 )
 
 type containerInfo struct {
@@ -132,9 +147,22 @@ type containerInfo struct {
 	// nvidiaUVMDevMajor is the device major number used for nvidia-uvm.
 	nvidiaUVMDevMajor uint32
 
-	// nvidiaDriverVersion is the Nvidia driver version on the host.
+	// nvidiaDriverVersion is the NVIDIA driver ABI version to use for
+	// communicating with NVIDIA devices on the host.
 	nvidiaDriverVersion string
 }
+
+type loaderState int
+
+const (
+	// created indicates that the Loader has been created, but not started yet.
+	created loaderState = iota
+	// started indicates that the Loader has been started.
+	started
+	// restoring indicates that the Loader has been created and is restoring
+	// containers. It will change to started after restore is completed.
+	restoring
+)
 
 // Loader keeps state needed to start the kernel and run the container.
 type Loader struct {
@@ -163,6 +191,8 @@ type Loader struct {
 	// restore is set to true if we are restoring a container.
 	restore bool
 
+	restoreWaiters *sync.Cond
+
 	// sandboxID is the ID for the whole sandbox.
 	sandboxID string
 
@@ -174,24 +204,49 @@ type Loader struct {
 	// /sys/devices/virtual/dmi/id/product_name.
 	productName string
 
+	// hostShmemHuge is the host's value of
+	// /sys/kernel/mm/transparent_hugepage/shmem_enabled.
+	hostShmemHuge string
+
 	// mu guards the fields below.
 	mu sync.Mutex
 
+	// +checklocks:mu
+	state loaderState
+
 	// sharedMounts holds VFS mounts that may be shared between containers within
 	// the same pod. It is mapped by mount source.
+	//
+	// +checklocks:mu
 	sharedMounts map[string]*vfs.Mount
 
 	// processes maps containers init process and invocation of exec. Root
 	// processes are keyed with container ID and pid=0, while exec invocations
 	// have the corresponding pid set.
 	//
-	// processes is guarded by mu.
+	// +checklocks:mu
 	processes map[execID]*execProcess
+
+	// containerIDs store container names and IDs to assist with restore and container
+	// naming when user didn't provide one.
+	//
+	// Mapping: name -> cid.
+	// +checklocks:mu
+	containerIDs map[string]string
+
+	// containerSpecs stores container specs for each container in sandbox.
+	//
+	// Mapping: cid -> spec.
+	// +checklocks:mu
+	containerSpecs map[string]*specs.Spec
 
 	// portForwardProxies is a list of active port forwarding connections.
 	//
-	// portForwardProxies is guarded by mu.
+	// +checklocks:mu
 	portForwardProxies []*pf.Proxy
+
+	// +checklocks:mu
+	saveFDs []*fd.FD
 }
 
 // execID uniquely identifies a sentry process that is executed in a container.
@@ -250,7 +305,7 @@ type Args struct {
 	ControllerFD int
 	// Device is an optional argument that is passed to the platform. The Loader
 	// takes ownership of this file and may close it at any time.
-	Device *os.File
+	Device *fd.FD
 	// GoferFDs is an array of FDs used to connect with the Gofer. The Loader
 	// takes ownership of these FDs and may close them at any time.
 	GoferFDs []int
@@ -293,8 +348,15 @@ type Args struct {
 	// ProfileOpts contains the set of profiles to enable and the
 	// corresponding FDs where profile data will be written.
 	ProfileOpts profile.Opts
-	// NvidiaDriverVersion is the Nvidia driver version on the host.
+	// NvidiaDriverVersion is the NVIDIA driver ABI version to use for
+	// communicating with NVIDIA devices on the host.
 	NvidiaDriverVersion string
+	// HostShmemHuge is the host's value of
+	// /sys/kernel/mm/transparent_hugepage/shmem_enabled, or empty if this is
+	// unknown.
+	HostShmemHuge string
+
+	SaveFDs []*fd.FD
 }
 
 // make sure stdioFDs are always the same on initial start and on restore
@@ -330,7 +392,11 @@ func getRootCredentials(spec *specs.Spec, conf *config.Config, userNs *auth.User
 // New initializes a new kernel loader configured by spec.
 // New also handles setting up a kernel for restoring a container.
 func New(args Args) (*Loader, error) {
-	stopProfiling := profile.Start(args.ProfileOpts)
+	stopProfilingRuntime := profile.Start(args.ProfileOpts)
+	stopProfiling := func() {
+		stopProfilingRuntime()
+		metric.StopProfilingMetrics()
+	}
 
 	// Initialize seccheck points.
 	seccheck.Initialize()
@@ -351,9 +417,23 @@ func New(args Args) (*Loader, error) {
 
 	kernel.IOUringEnabled = args.Conf.IOUring
 
-	info := containerInfo{
+	eid := execID{cid: args.ID}
+	l := &Loader{
+		sandboxID:      args.ID,
+		processes:      map[execID]*execProcess{eid: {}},
+		sharedMounts:   make(map[string]*vfs.Mount),
+		stopProfiling:  stopProfiling,
+		productName:    args.ProductName,
+		hostShmemHuge:  args.HostShmemHuge,
+		containerIDs:   make(map[string]string),
+		containerSpecs: make(map[string]*specs.Spec),
+		saveFDs:        args.SaveFDs,
+	}
+
+	containerName := l.registerContainer(args.Spec, args.ID)
+	l.root = containerInfo{
 		cid:                 args.ID,
-		containerName:       specutils.ContainerName(args.Spec),
+		containerName:       containerName,
 		conf:                args.Conf,
 		spec:                args.Spec,
 		goferMountConfs:     args.GoferMountConfs,
@@ -378,25 +458,25 @@ func New(args Args) (*Loader, error) {
 		if err != nil {
 			return nil, fmt.Errorf("dup3 of stdios failed: %w", err)
 		}
-		info.stdioFDs = append(info.stdioFDs, fd.New(newfd))
+		l.root.stdioFDs = append(l.root.stdioFDs, fd.New(newfd))
 		_ = unix.Close(stdioFD)
 		newfd++
 	}
 	for _, goferFD := range args.GoferFDs {
-		info.goferFDs = append(info.goferFDs, fd.New(goferFD))
+		l.root.goferFDs = append(l.root.goferFDs, fd.New(goferFD))
 	}
 	for _, filestoreFD := range args.GoferFilestoreFDs {
-		info.goferFilestoreFDs = append(info.goferFilestoreFDs, fd.New(filestoreFD))
+		l.root.goferFilestoreFDs = append(l.root.goferFilestoreFDs, fd.New(filestoreFD))
 	}
 	if args.DevGoferFD >= 0 {
-		info.devGoferFD = fd.New(args.DevGoferFD)
+		l.root.devGoferFD = fd.New(args.DevGoferFD)
 	}
 	if args.ExecFD >= 0 {
-		info.execFD = fd.New(args.ExecFD)
+		l.root.execFD = fd.New(args.ExecFD)
 	}
 
 	for _, customFD := range args.PassFDs {
-		info.passFDs = append(info.passFDs, fdMapping{
+		l.root.passFDs = append(l.root.passFDs, fdMapping{
 			host:  fd.New(customFD.Host),
 			guest: customFD.Guest,
 		})
@@ -410,28 +490,27 @@ func New(args Args) (*Loader, error) {
 	if specutils.NVProxyEnabled(args.Spec, args.Conf) && p.OwnsPageTables() {
 		return nil, fmt.Errorf("--nvproxy is incompatible with platform %s: owns page tables", args.Conf.Platform)
 	}
-	k := &kernel.Kernel{
-		Platform: p,
-	}
+	l.k = &kernel.Kernel{Platform: p}
 
 	// Create memory file.
-	mf, err := createMemoryFile()
+	mf, err := createMemoryFile(args.Conf.AppHugePages, args.HostShmemHuge)
 	if err != nil {
 		return nil, fmt.Errorf("creating memory file: %w", err)
 	}
-	k.SetMemoryFile(mf)
+	l.k.SetMemoryFile(mf)
 
 	// Create VDSO.
 	//
 	// Pass k as the platform since it is savable, unlike the actual platform.
-	vdso, err := loader.PrepareVDSO(k)
+	vdso, err := loader.PrepareVDSO(l.k.MemoryFile())
 	if err != nil {
 		return nil, fmt.Errorf("creating vdso: %w", err)
 	}
 
 	// Create timekeeper.
-	tk := kernel.NewTimekeeper(k, vdso.ParamPage.FileRange())
-	tk.SetClocks(time.NewCalibratedClocks())
+	tk := kernel.NewTimekeeper()
+	params := kernel.NewVDSOParamPage(l.k.MemoryFile(), vdso.ParamPage.FileRange())
+	tk.SetClocks(time.NewCalibratedClocks(), params)
 
 	if err := enableStrace(args.Conf); err != nil {
 		return nil, fmt.Errorf("enabling strace: %w", err)
@@ -442,7 +521,7 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("getting root credentials")
 	}
 	// Create root network namespace/stack.
-	netns, err := newRootNetworkNamespace(args.Conf, tk, k, creds.UserNamespace)
+	netns, err := newRootNetworkNamespace(args.Conf, tk, creds.UserNamespace)
 	if err != nil {
 		return nil, fmt.Errorf("creating network: %w", err)
 	}
@@ -482,13 +561,14 @@ func New(args Args) (*Loader, error) {
 	}
 	// Initiate the Kernel object, which is required by the Context passed
 	// to createVFS in order to mount (among other things) procfs.
-	if err = k.Init(kernel.InitKernelArgs{
+	if err = l.k.Init(kernel.InitKernelArgs{
 		FeatureSet:           cpuid.HostFeatureSet().Fixed(),
 		Timekeeper:           tk,
 		RootUserNamespace:    creds.UserNamespace,
 		RootNetworkNamespace: netns,
 		ApplicationCores:     uint(args.NumCPU),
 		Vdso:                 vdso,
+		VdsoParams:           params,
 		RootUTSNamespace:     kernel.NewUTSNamespace(args.Spec.Hostname, args.Spec.Hostname, creds.UserNamespace),
 		RootIPCNamespace:     kernel.NewIPCNamespace(creds.UserNamespace),
 		PIDNamespace:         kernel.NewRootPIDNamespace(creds.UserNamespace),
@@ -497,7 +577,7 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
 
-	if err := registerFilesystems(k, &info); err != nil {
+	if err := registerFilesystems(l.k, &l.root); err != nil {
 		return nil, fmt.Errorf("registering filesystems: %w", err)
 	}
 
@@ -513,30 +593,30 @@ func New(args Args) (*Loader, error) {
 	// Create a watchdog.
 	dogOpts := watchdog.DefaultOpts
 	dogOpts.TaskTimeoutAction = args.Conf.WatchdogAction
-	dog := watchdog.New(k, dogOpts)
+	l.watchdog = watchdog.New(l.k, dogOpts)
 
-	procArgs, err := createProcessArgs(args.ID, args.Spec, creds, k, k.RootPIDNamespace())
+	procArgs, err := createProcessArgs(args.ID, args.Spec, args.Conf, creds, l.k, l.k.RootPIDNamespace())
 	if err != nil {
 		return nil, fmt.Errorf("creating init process for root container: %w", err)
 	}
-	info.procArgs = procArgs
+	l.root.procArgs = procArgs
 
 	if err := initCompatLogs(args.UserLogFD); err != nil {
 		return nil, fmt.Errorf("initializing compat logs: %w", err)
 	}
 
-	mountHints, err := NewPodMountHints(args.Spec)
+	l.mountHints, err = NewPodMountHints(args.Spec)
 	if err != nil {
 		return nil, fmt.Errorf("creating pod mount hints: %w", err)
 	}
 
 	// Set up host mount that will be used for imported fds.
-	hostFilesystem, err := host.NewFilesystem(k.VFS())
+	hostFilesystem, err := host.NewFilesystem(l.k.VFS())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create hostfs filesystem: %w", err)
 	}
-	defer hostFilesystem.DecRef(k.SupervisorContext())
-	k.SetHostMount(k.VFS().NewDisconnectedMount(hostFilesystem, nil, &vfs.MountOptions{}))
+	defer hostFilesystem.DecRef(l.k.SupervisorContext())
+	l.k.SetHostMount(l.k.VFS().NewDisconnectedMount(hostFilesystem, nil, &vfs.MountOptions{}))
 
 	if args.PodInitConfigFD >= 0 {
 		if err := setupSeccheck(args.PodInitConfigFD, args.SinkFDs); err != nil {
@@ -544,23 +624,20 @@ func New(args Args) (*Loader, error) {
 		}
 	}
 
-	eid := execID{cid: args.ID}
-	l := &Loader{
-		k:             k,
-		watchdog:      dog,
-		sandboxID:     args.ID,
-		processes:     map[execID]*execProcess{eid: {}},
-		mountHints:    mountHints,
-		sharedMounts:  make(map[string]*vfs.Mount),
-		root:          info,
-		stopProfiling: stopProfiling,
-		productName:   args.ProductName,
-	}
+	l.k.RegisterContainerName(args.ID, l.root.containerName)
 
 	// We don't care about child signals; some platforms can generate a
 	// tremendous number of useless ones (I'm looking at you, ptrace).
 	if err := sighandling.IgnoreChildStop(); err != nil {
 		return nil, fmt.Errorf("ignore child stop signals failed: %w", err)
+	}
+
+	if len(args.Conf.TestOnlyAutosaveImagePath) != 0 {
+		enableAutosave(l, args.Conf.TestOnlyAutosaveResume, l.saveFDs)
+	}
+
+	if err := l.kernelInitExtra(); err != nil {
+		return nil, err
 	}
 
 	// Create the control server using the provided FD.
@@ -583,9 +660,9 @@ func New(args Args) (*Loader, error) {
 }
 
 // createProcessArgs creates args that can be used with kernel.CreateProcess.
-func createProcessArgs(id string, spec *specs.Spec, creds *auth.Credentials, k *kernel.Kernel, pidns *kernel.PIDNamespace) (kernel.CreateProcessArgs, error) {
+func createProcessArgs(id string, spec *specs.Spec, conf *config.Config, creds *auth.Credentials, k *kernel.Kernel, pidns *kernel.PIDNamespace) (kernel.CreateProcessArgs, error) {
 	// Create initial limits.
-	ls, err := createLimitSet(spec)
+	ls, err := createLimitSet(spec, specutils.TPUProxyIsEnabled(spec, conf))
 	if err != nil {
 		return kernel.CreateProcessArgs{}, fmt.Errorf("creating limits: %w", err)
 	}
@@ -629,9 +706,11 @@ func (l *Loader) Destroy() {
 	l.watchdog.Stop()
 
 	ctx := l.k.SupervisorContext()
+	l.mu.Lock()
 	for _, m := range l.sharedMounts {
 		m.DecRef(ctx)
 	}
+	l.mu.Unlock()
 
 	// Stop the control server. This will indirectly stop any
 	// long-running control operations that are in flight, e.g.
@@ -669,7 +748,7 @@ func (l *Loader) Destroy() {
 	refs.OnExit()
 }
 
-func createPlatform(conf *config.Config, deviceFile *os.File) (platform.Platform, error) {
+func createPlatform(conf *config.Config, deviceFile *fd.FD) (platform.Platform, error) {
 	p, err := platform.Lookup(conf.Platform)
 	if err != nil {
 		panic(fmt.Sprintf("invalid platform %s: %s", conf.Platform, err))
@@ -678,17 +757,45 @@ func createPlatform(conf *config.Config, deviceFile *os.File) (platform.Platform
 	return p.New(deviceFile)
 }
 
-func createMemoryFile() (*pgalloc.MemoryFile, error) {
+func createMemoryFile(appHugePages bool, hostShmemHuge string) (*pgalloc.MemoryFile, error) {
 	const memfileName = "runsc-memory"
 	memfd, err := memutil.CreateMemFD(memfileName, 0)
 	if err != nil {
 		return nil, fmt.Errorf("error creating memfd: %w", err)
 	}
 	memfile := os.NewFile(uintptr(memfd), memfileName)
-	// We can't enable pgalloc.MemoryFileOpts.UseHostMemcgPressure even if
-	// there are memory cgroups specified, because at this point we're already
-	// in a mount namespace in which the relevant cgroupfs is not visible.
-	mf, err := pgalloc.NewMemoryFile(memfile, pgalloc.MemoryFileOpts{})
+
+	mfopts := pgalloc.MemoryFileOpts{
+		// We can't enable pgalloc.MemoryFileOpts.UseHostMemcgPressure even if
+		// there are memory cgroups specified, because at this point we're already
+		// in a mount namespace in which the relevant cgroupfs is not visible.
+	}
+	if appHugePages {
+		switch hostShmemHuge {
+		case "":
+			log.Infof("Disabling application huge pages: host shmem_huge is unknown")
+		case "never", "deny":
+			log.Infof("Disabling application huge pages: host shmem_huge is %q", hostShmemHuge)
+		case "advise":
+			log.Infof("Enabling application huge pages: host shmem_huge is %q", hostShmemHuge)
+			mfopts.ExpectHugepages = true
+			mfopts.AdviseHugepage = true
+		case "always", "within_size":
+			log.Infof("Enabling application huge pages: host shmem_huge is %q", hostShmemHuge)
+			// In these cases, memfds will default to using huge pages, and we have to
+			// explicitly ask for small pages.
+			mfopts.ExpectHugepages = true
+			mfopts.AdviseNoHugepage = true
+		case "force":
+			log.Infof("Enabling application huge pages: host shmem_huge is %q", hostShmemHuge)
+			// The kernel will ignore MADV_NOHUGEPAGE, so don't bother.
+			mfopts.ExpectHugepages = true
+		default:
+			log.Infof("Disabling application huge pages: host shmem_huge is unknown value %q", hostShmemHuge)
+		}
+	}
+
+	mf, err := pgalloc.NewMemoryFile(memfile, mfopts)
 	if err != nil {
 		_ = memfile.Close()
 		return nil, fmt.Errorf("error creating pgalloc.MemoryFile: %w", err)
@@ -831,7 +938,11 @@ func (l *Loader) run() error {
 
 	log.Infof("Process should have started...")
 	l.watchdog.Start()
-	return l.k.Start()
+	if err := l.k.Start(); err != nil {
+		return err
+	}
+	l.state = started
+	return nil
 }
 
 // createSubcontainer creates a new container inside the sandbox.
@@ -887,9 +998,10 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 		pidns = l.k.RootPIDNamespace()
 	}
 
+	containerName := l.registerContainerLocked(spec, cid)
 	info := &containerInfo{
 		cid:                 cid,
-		containerName:       specutils.ContainerName(spec),
+		containerName:       containerName,
 		conf:                conf,
 		spec:                spec,
 		goferFDs:            goferFDs,
@@ -900,7 +1012,7 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 		nvidiaDriverVersion: l.root.nvidiaDriverVersion,
 	}
 	var err error
-	info.procArgs, err = createProcessArgs(cid, spec, creds, l.k, pidns)
+	info.procArgs, err = createProcessArgs(cid, spec, conf, creds, l.k, pidns)
 	if err != nil {
 		return fmt.Errorf("creating new process: %w", err)
 	}
@@ -926,7 +1038,7 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 			// createContainerProcess() will consume devGoferFD and initialize a gofer
 			// connection. This connection is owned by l.k. In case of failure, we want
 			// to clean up this gofer connection so that the gofer process can exit.
-			l.k.RemoveDevGofer(cid)
+			l.k.RemoveDevGofer(containerName)
 		})
 	}
 
@@ -955,6 +1067,7 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 		})
 	}
 
+	l.k.RegisterContainerName(cid, info.containerName)
 	l.k.StartProcess(ep.tg)
 	// No more failures from this point on.
 	cu.Release()
@@ -1152,7 +1265,7 @@ func (l *Loader) destroySubcontainer(cid string) error {
 		}
 	}
 	// Cleanup the device gofer.
-	l.k.RemoveDevGofer(cid)
+	l.k.RemoveDevGofer(l.k.ContainerName(cid))
 
 	log.Debugf("Container destroyed, cid: %s", cid)
 	return nil
@@ -1179,6 +1292,11 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	if args.MountNamespace == nil || !args.MountNamespace.TryIncRef() {
 		return 0, fmt.Errorf("container %q has stopped", args.ContainerID)
 	}
+	sctx := l.k.SupervisorContext()
+	root := args.MountNamespace.Root(sctx)
+	defer root.DecRef(sctx)
+	ctx := vfs.WithRoot(sctx, root)
+	defer args.MountNamespace.DecRef(ctx)
 
 	args.Envv, err = specutils.ResolveEnvs(args.Envv)
 	if err != nil {
@@ -1186,18 +1304,13 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	}
 
 	// Add the HOME environment variable if it is not already set.
-	sctx := l.k.SupervisorContext()
-	root := args.MountNamespace.Root(sctx)
-	defer root.DecRef(sctx)
-	ctx := vfs.WithRoot(sctx, root)
-	defer args.MountNamespace.DecRef(ctx)
 	args.Envv, err = user.MaybeAddExecUserHome(ctx, args.MountNamespace, args.KUID, args.Envv)
 	if err != nil {
 		return 0, err
 	}
 	args.PIDNamespace = tg.PIDNamespace()
 
-	args.Limits, err = createLimitSet(l.root.spec)
+	args.Limits, err = createLimitSet(l.root.spec, specutils.TPUProxyIsEnabled(l.root.spec, l.root.conf))
 	if err != nil {
 		return 0, fmt.Errorf("creating limits: %w", err)
 	}
@@ -1223,9 +1336,26 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 	// Don't defer unlock, as doing so would make it impossible for
 	// multiple clients to wait on the same container.
-	tg, err := l.threadGroupFromID(execID{cid: cid})
+	key := execID{cid: cid}
+	tg, err := l.threadGroupFromID(key)
 	if err != nil {
-		return fmt.Errorf("can't wait for container %q: %w", cid, err)
+		l.mu.Lock()
+		// Extra handling is needed if the container is restoring.
+		if l.state != restoring {
+			l.mu.Unlock()
+			return err
+		}
+		// Container could be restoring, first check if container exists.
+		if _, err := l.findProcessLocked(key); err != nil {
+			l.mu.Unlock()
+			return err
+		}
+		log.Infof("Waiting for container being restored, CID: %q", cid)
+		l.restoreWaiters.Wait()
+		l.mu.Unlock()
+
+		log.Infof("Restore is completed, trying to wait for container %q again.", cid)
+		return l.waitContainer(cid, waitStatus)
 	}
 
 	// If the thread either has already exited or exits during waiting,
@@ -1300,7 +1430,7 @@ func (l *Loader) WaitExit() linux.WaitStatus {
 	return l.k.GlobalInit().ExitStatus()
 }
 
-func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, uniqueID stack.UniqueID, userns *auth.UserNamespace) (*inet.Namespace, error) {
+func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, userns *auth.UserNamespace) (*inet.Namespace, error) {
 	// Create an empty network stack because the network namespace may be empty at
 	// this point. Netns is configured before Run() is called. Netstack is
 	// configured using a control uRPC message. Host network is configured inside
@@ -1317,13 +1447,12 @@ func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, uniqueID st
 		return inet.NewRootNamespace(hostinet.NewStack(), nil, userns), nil
 
 	case config.NetworkNone, config.NetworkSandbox:
-		s, err := newEmptySandboxNetworkStack(clock, uniqueID, conf.AllowPacketEndpointWrite)
+		s, err := newEmptySandboxNetworkStack(clock, conf.AllowPacketEndpointWrite)
 		if err != nil {
 			return nil, err
 		}
 		creator := &sandboxNetstackCreator{
 			clock:                    clock,
-			uniqueID:                 uniqueID,
 			allowPacketEndpointWrite: conf.AllowPacketEndpointWrite,
 		}
 		return inet.NewRootNamespace(s, creator, userns), nil
@@ -1334,7 +1463,7 @@ func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, uniqueID st
 
 }
 
-func newEmptySandboxNetworkStack(clock tcpip.Clock, uniqueID stack.UniqueID, allowPacketEndpointWrite bool) (inet.Stack, error) {
+func newEmptySandboxNetworkStack(clock tcpip.Clock, allowPacketEndpointWrite bool) (*netstack.Stack, error) {
 	netProtos := []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol, arp.NewProtocol}
 	transProtos := []stack.TransportProtocolFactory{
 		tcp.NewProtocol,
@@ -1352,7 +1481,6 @@ func newEmptySandboxNetworkStack(clock tcpip.Clock, uniqueID stack.UniqueID, all
 		// privileges.
 		RawFactory:               raw.EndpointFactory{},
 		AllowPacketEndpointWrite: allowPacketEndpointWrite,
-		UniqueID:                 uniqueID,
 		DefaultIPTables:          netfilter.DefaultLinuxTables,
 	})}
 
@@ -1391,23 +1519,28 @@ func newEmptySandboxNetworkStack(clock tcpip.Clock, uniqueID stack.UniqueID, all
 // +stateify savable
 type sandboxNetstackCreator struct {
 	clock                    tcpip.Clock
-	uniqueID                 stack.UniqueID
 	allowPacketEndpointWrite bool
 }
 
 // CreateStack implements kernel.NetworkStackCreator.CreateStack.
 func (f *sandboxNetstackCreator) CreateStack() (inet.Stack, error) {
-	s, err := newEmptySandboxNetworkStack(f.clock, f.uniqueID, f.allowPacketEndpointWrite)
+	s, err := newEmptySandboxNetworkStack(f.clock, f.allowPacketEndpointWrite)
 	if err != nil {
 		return nil, err
 	}
 
 	// Setup loopback.
-	n := &Network{Stack: s.(*netstack.Stack).Stack}
-	nicID := tcpip.NICID(f.uniqueID.UniqueID())
+	n := &Network{Stack: s.Stack}
+	nicID := s.Stack.NextNICID()
+	if nicID != linux.LOOPBACK_IFINDEX {
+		return nil, fmt.Errorf("loopback device should always have index %d, got %d", linux.LOOPBACK_IFINDEX, nicID)
+	}
 	link := DefaultLoopbackLink
-	linkEP := packetsocket.New(ethernet.New(loopback.New()))
-	opts := stack.NICOptions{Name: link.Name}
+	linkEP := ethernet.New(loopback.New())
+	opts := stack.NICOptions{
+		Name:               link.Name,
+		DeliverLinkPackets: true,
+	}
 
 	if err := n.createNICWithAddrs(nicID, linkEP, opts, link.Addresses); err != nil {
 		return nil, err
@@ -1543,11 +1676,12 @@ func (l *Loader) threadGroupFromID(key execID) (*kernel.ThreadGroup, error) {
 // tryThreadGroupFromIDLocked returns the thread group for the given execution
 // ID. It may return nil in case the container has not started yet. Returns
 // error if execution ID is invalid or if the container cannot be found (maybe
-// it has been deleted). Caller must hold 'mu'.
+// it has been deleted).
+// +checklocks:l.mu
 func (l *Loader) tryThreadGroupFromIDLocked(key execID) (*kernel.ThreadGroup, error) {
-	ep := l.processes[key]
-	if ep == nil {
-		return nil, fmt.Errorf("container %q not found", key.cid)
+	ep, err := l.findProcessLocked(key)
+	if err != nil {
+		return nil, err
 	}
 	return ep.tg, nil
 }
@@ -1555,11 +1689,12 @@ func (l *Loader) tryThreadGroupFromIDLocked(key execID) (*kernel.ThreadGroup, er
 // ttyFromIDLocked returns the TTY files for the given execution ID. It may
 // return nil in case the container has not started yet. Returns error if
 // execution ID is invalid or if the container cannot be found (maybe it has
-// been deleted). Caller must hold 'mu'.
+// been deleted).
+// +checklocks:l.mu
 func (l *Loader) ttyFromIDLocked(key execID) (*host.TTYFileDescription, error) {
-	ep := l.processes[key]
-	if ep == nil {
-		return nil, fmt.Errorf("container %q not found", key.cid)
+	ep, err := l.findProcessLocked(key)
+	if err != nil {
+		return nil, err
 	}
 	return ep.tty, nil
 }
@@ -1584,7 +1719,7 @@ func createFDTable(ctx context.Context, console bool, stdioFDs []*fd.FD, passFDs
 
 	k := kernel.KernelFromContext(ctx)
 	fdTable := k.NewFDTable()
-	ttyFile, err := fdimport.Import(ctx, fdTable, console, auth.KUID(user.UID), auth.KGID(user.GID), fdMap)
+	ttyFile, err := fdimport.Import(ctx, fdTable, console, auth.KUID(user.UID), auth.KGID(user.GID), fdMap, containerName)
 	if err != nil {
 		fdTable.DecRef(ctx)
 		return nil, nil, err
@@ -1713,4 +1848,84 @@ func (l *Loader) pidsCount(cid string) (int, error) {
 		return 0, err
 	}
 	return l.k.TaskSet().Root.NumTasksPerContainer(cid), nil
+}
+
+func (l *Loader) networkStats() ([]*NetworkInterface, error) {
+	var stats []*NetworkInterface
+	stack := l.k.RootNetworkNamespace().Stack()
+	for _, i := range stack.Interfaces() {
+		var stat inet.StatDev
+		if err := stack.Statistics(&stat, i.Name); err != nil {
+			return nil, err
+		}
+		stats = append(stats, &NetworkInterface{
+			Name:      i.Name,
+			RxBytes:   stat[0],
+			RxPackets: stat[1],
+			RxErrors:  stat[2],
+			RxDropped: stat[3],
+			TxBytes:   stat[8],
+			TxPackets: stat[9],
+			TxErrors:  stat[10],
+			TxDropped: stat[11],
+		})
+	}
+	return stats, nil
+}
+
+// +checklocks:l.mu
+func (l *Loader) findProcessLocked(key execID) (*execProcess, error) {
+	ep := l.processes[key]
+	if ep == nil {
+		return nil, fmt.Errorf("container %q not found", key.cid)
+	}
+	return ep, nil
+}
+
+func (l *Loader) registerContainer(spec *specs.Spec, cid string) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.registerContainerLocked(spec, cid)
+}
+
+// +checklocks:l.mu
+func (l *Loader) registerContainerLocked(spec *specs.Spec, cid string) string {
+	containerName := specutils.ContainerName(spec)
+	if len(containerName) == 0 {
+		// If no name was provided, require containers to be restored in the same order
+		// they were created.
+		containerName = "__no_name_" + strconv.Itoa(len(l.containerIDs))
+	}
+
+	l.containerIDs[containerName] = cid
+	l.containerSpecs[cid] = spec
+	return containerName
+}
+
+func (l *Loader) getContainerSpec(cid string) *specs.Spec {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.containerSpecs[cid]
+}
+
+func (l *Loader) containerRuntimeState(cid string) ContainerRuntimeState {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	exec, ok := l.processes[execID{cid: cid}]
+	if !ok {
+		// Can't distinguish between invalid CID and stopped container, assume that
+		// CID is valid.
+		return RuntimeStateStopped
+	}
+	if exec.tg == nil {
+		// Container has no thread group assigned, so it has started yet.
+		return RuntimeStateCreating
+	}
+	if exec.tg.Leader().ExitState() == kernel.TaskExitNone {
+		// Init process is still running.
+		return RuntimeStateRunning
+	}
+	// Init process has stopped, but no one has called wait on it yet.
+	return RuntimeStateStopped
 }

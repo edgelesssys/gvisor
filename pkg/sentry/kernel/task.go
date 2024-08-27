@@ -36,6 +36,17 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
+// TaskOrigin indicates how the task was initially created.
+type TaskOrigin int
+
+const (
+	// OriginUnknown indicates that task creation source is not known (or not important).
+	OriginUnknown TaskOrigin = iota
+
+	// OriginExec indicates that task was created due to an exec request inside a container.
+	OriginExec
+)
+
 // Task represents a thread of execution in the untrusted app.  It
 // includes registers and any thread-specific state that you would
 // normally expect.
@@ -319,15 +330,13 @@ type Task struct {
 	goroutineStopped sync.WaitGroup `state:"nosave"`
 
 	// ptraceTracer is the task that is ptrace-attached to this one. If
-	// ptraceTracer is nil, this task is not being traced. Note that due to
-	// atomic.Value limitations (atomic.Value.Store(nil) panics), a nil
-	// ptraceTracer is always represented as a typed nil (i.e. (*Task)(nil)).
+	// ptraceTracer is nil, this task is not being traced.
 	//
 	// ptraceTracer is protected by the TaskSet mutex, and accessed with atomic
 	// operations. This allows paths that wouldn't otherwise lock the TaskSet
 	// mutex, notably the syscall path, to check if ptraceTracer is nil without
 	// additional synchronization.
-	ptraceTracer atomic.Value `state:".(*Task)"`
+	ptraceTracer atomic.Pointer[Task] `state:".(*Task)"`
 
 	// ptraceTracees is the set of tasks that this task is ptrace-attached to.
 	//
@@ -413,7 +422,7 @@ type Task struct {
 
 	// logPrefix is a string containing the task's thread ID in the root PID
 	// namespace, and is prepended to log messages emitted by Task.Infof etc.
-	logPrefix atomic.Value `state:"nosave"`
+	logPrefix atomic.Pointer[string] `state:"nosave"`
 
 	// traceContext and traceTask are both used for tracing, and are
 	// updated along with the logPrefix in updateInfoLocked.
@@ -452,12 +461,10 @@ type Task struct {
 
 	// seccomp contains all seccomp-bpf syscall filters applicable to the task.
 	// The type of the atomic is *taskSeccomp.
-	// Writing needs to be protected by the signal mutex. Note that due to
-	// atomic.Value limitations (atomic.Value.Store(nil) panics), a nil
-	// seccomp is always represented as a typed nil (i.e. (*taskSeccomp)(nil)).
+	// Writing needs to be protected by the signal mutex.
 	//
 	// seccomp is owned by the task goroutine.
-	seccomp atomic.Value `state:".(*taskSeccomp)"`
+	seccomp atomic.Pointer[taskSeccomp] `state:".(*taskSeccomp)"`
 
 	// If cleartid is non-zero, treat it as a pointer to a ThreadID in the
 	// task's virtual address space; when the task exits, set the pointed-to
@@ -600,6 +607,9 @@ type Task struct {
 	//
 	// +checklocks:mu
 	sessionKeyring *auth.Key
+
+	// Origin is the origin of the task.
+	Origin TaskOrigin
 }
 
 // Task related metrics
@@ -607,34 +617,40 @@ var (
 	// syscallCounter is a metric that tracks how many syscalls the sentry has
 	// executed.
 	syscallCounter = metric.SentryProfiling.MustCreateNewUint64Metric(
-		"/task/syscalls", false, "The number of syscalls the sentry has executed for the user.")
+		"/task/syscalls", metric.Uint64Metadata{
+			Cumulative:  true,
+			Description: "The number of syscalls the sentry has executed for the user.",
+		})
 
 	// faultCounter is a metric that tracks how many faults the sentry has had to
 	// handle.
 	faultCounter = metric.SentryProfiling.MustCreateNewUint64Metric(
-		"/task/faults", false, "The number of faults the sentry has handled.")
+		"/task/faults", metric.Uint64Metadata{
+			Cumulative:  true,
+			Description: "The number of faults the sentry has handled.",
+		})
 )
 
 func (t *Task) savePtraceTracer() *Task {
-	return t.ptraceTracer.Load().(*Task)
+	return t.ptraceTracer.Load()
 }
 
-func (t *Task) loadPtraceTracer(tracer *Task) {
+func (t *Task) loadPtraceTracer(_ gocontext.Context, tracer *Task) {
 	t.ptraceTracer.Store(tracer)
 }
 
 func (t *Task) saveSeccomp() *taskSeccomp {
-	return t.seccomp.Load().(*taskSeccomp)
+	return t.seccomp.Load()
 }
 
-func (t *Task) loadSeccomp(seccompData *taskSeccomp) {
+func (t *Task) loadSeccomp(_ gocontext.Context, seccompData *taskSeccomp) {
 	t.seccomp.Store(seccompData)
 }
 
 // afterLoad is invoked by stateify.
-func (t *Task) afterLoad() {
+func (t *Task) afterLoad(gocontext.Context) {
 	t.updateInfoLocked()
-	if ts := t.seccomp.Load().(*taskSeccomp); ts != nil {
+	if ts := t.seccomp.Load(); ts != nil {
 		ts.populateCache(t)
 	}
 	t.interruptChan = make(chan struct{}, 1)

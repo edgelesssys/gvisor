@@ -34,6 +34,7 @@ package kernel
 import (
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"time"
 
@@ -45,6 +46,7 @@ import (
 	"gvisor.dev/gvisor/pkg/devutil"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/eventchannel"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
@@ -73,7 +75,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/state"
-	"gvisor.dev/gvisor/pkg/state/wire"
+	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
@@ -142,8 +144,7 @@ type Kernel struct {
 	// All of the following fields are immutable unless otherwise specified.
 
 	// Platform is the platform that is used to execute tasks in the created
-	// Kernel. See comment on pgalloc.MemoryFileProvider for why Platform is
-	// embedded anonymously (the same issue applies).
+	// Kernel.
 	platform.Platform `state:"nosave"`
 
 	// mf provides application memory.
@@ -159,6 +160,7 @@ type Kernel struct {
 	useHostCores         bool
 	extraAuxv            []arch.AuxEntry
 	vdso                 *loader.VDSO
+	vdsoParams           *VDSOParamPage
 	rootUTSNamespace     *UTSNamespace
 	rootIPCNamespace     *IPCNamespace
 
@@ -346,9 +348,50 @@ type Kernel struct {
 	// used by processes.
 	MaxFDLimit atomicbitops.Int32
 
-	// devGofers maps container ID to its device gofer client.
+	// devGofers maps containers (using its name) to its device gofer client.
 	devGofers   map[string]*devutil.GoferClient `state:"nosave"`
 	devGofersMu sync.Mutex                      `state:"nosave"`
+
+	// containerNames store the container name based on their container ID.
+	// Names are preserved between save/restore session, while IDs can change.
+	//
+	// Mapping: cid -> name.
+	// It's protected by extMu.
+	containerNames map[string]string
+
+	// checkpointMu is used to protect the checkpointing related fields below.
+	checkpointMu sync.Mutex `state:"nosave"`
+
+	// checkpointCond is used to wait for a checkpoint to complete. It uses
+	// checkpointMu as its mutex.
+	checkpointCond sync.Cond `state:"nosave"`
+
+	// additionalCheckpointState stores additional state that needs
+	// to be checkpointed. It's protected by checkpointMu.
+	additionalCheckpointState map[any]any
+
+	// saver implements the Saver interface, which (as of writing) supports
+	// asynchronous checkpointing. It's protected by checkpointMu.
+	saver Saver `state:"nosave"`
+
+	// checkpointCounter aims to track the number of times the kernel has been
+	// successfully checkpointed. It's updated via calls to OnCheckpointAttempt()
+	// and IncCheckpointCount(). Kernel checkpoint-ers must call these methods
+	// appropriately so the counter is accurate. It's protected by checkpointMu.
+	checkpointCounter uint32
+
+	// lastCheckpointStatus is the error value returned from the most recent
+	// checkpoint attempt. If this value is nil, then the `checkpointCounter`-th
+	// checkpoint attempt succeeded and no checkpoint attempt has completed since.
+	// If this value is non-nil, then the `checkpointCounter`-th checkpoint
+	// attempt succeeded, after which at least one more checkpoint attempt was
+	// made and failed with this error. It's protected by checkpointMu.
+	lastCheckpointStatus error `state:"nosave"`
+}
+
+// Saver is an interface for saving the kernel.
+type Saver interface {
+	SaveAsync() error
 }
 
 // InitKernelArgs holds arguments to Init.
@@ -384,6 +427,9 @@ type InitKernelArgs struct {
 
 	// Vdso holds the VDSO and its parameter page.
 	Vdso *loader.VDSO
+
+	// VdsoParams is the VDSO parameter page manager.
+	VdsoParams *VDSOParamPage
 
 	// RootUTSNamespace is the root UTS namespace.
 	RootUTSNamespace *UTSNamespace
@@ -429,6 +475,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 		k.rootNetworkNamespace = inet.NewRootNamespace(nil, nil, args.RootUserNamespace)
 	}
 	k.runningTasksCond.L = &k.runningTasksMu
+	k.checkpointCond.L = &k.checkpointMu
 	k.cpuClockTickerWakeCh = make(chan struct{}, 1)
 	k.cpuClockTickerStopCond.L = &k.runningTasksMu
 	k.applicationCores = args.ApplicationCores
@@ -446,6 +493,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	}
 	k.extraAuxv = args.ExtraAuxv
 	k.vdso = args.Vdso
+	k.vdsoParams = args.VdsoParams
 	k.futexes = futex.NewManager()
 	k.netlinkPorts = port.New()
 	k.ptraceExceptions = make(map[*Task]*Task)
@@ -455,6 +503,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 		args.MaxFDLimit = MaxFdLimit
 	}
 	k.MaxFDLimit.Store(args.MaxFDLimit)
+	k.containerNames = make(map[string]string)
 
 	ctx := k.SupervisorContext()
 	if err := k.vfs.Init(ctx); err != nil {
@@ -522,10 +571,14 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 
 // +stateify savable
 type privateMemoryFileMetadata struct {
-	owners []vfs.RestoreID
+	owners []string
 }
 
-func savePrivateMFs(ctx context.Context, w wire.Writer, mfsToSave map[vfs.RestoreID]*pgalloc.MemoryFile) error {
+func savePrivateMFs(ctx context.Context, w io.Writer, pw io.Writer, mfsToSave map[string]*pgalloc.MemoryFile, mfOpts pgalloc.SaveOpts) error {
+	// mfOpts.ExcludeCommittedZeroPages is expected to reflect application
+	// memory usage behavior, but not necessarily usage of private MemoryFiles.
+	mfOpts.ExcludeCommittedZeroPages = false
+
 	var meta privateMemoryFileMetadata
 	// Generate the order in which private memory files are saved.
 	for fsID := range mfsToSave {
@@ -537,23 +590,20 @@ func savePrivateMFs(ctx context.Context, w wire.Writer, mfsToSave map[vfs.Restor
 	}
 	// Followed by the private memory files in order.
 	for _, fsID := range meta.owners {
-		if err := mfsToSave[fsID].SaveTo(ctx, w); err != nil {
+		if err := mfsToSave[fsID].SaveTo(ctx, w, pw, mfOpts); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func loadPrivateMFs(ctx context.Context, r wire.Reader) error {
+func loadPrivateMFs(ctx context.Context, r io.Reader, pr *statefile.AsyncReader) error {
 	// Load the metadata.
 	var meta privateMemoryFileMetadata
 	if _, err := state.Load(ctx, r, &meta); err != nil {
 		return err
 	}
-	var mfmap map[vfs.RestoreID]*pgalloc.MemoryFile
-	if mfmapv := ctx.Value(vfs.CtxFilesystemMemoryFileMap); mfmapv != nil {
-		mfmap = mfmapv.(map[vfs.RestoreID]*pgalloc.MemoryFile)
-	}
+	mfmap := pgalloc.MemoryFileMapFromContext(ctx)
 	// Ensure that it is consistent with CtxFilesystemMemoryFileMap.
 	if len(mfmap) != len(meta.owners) {
 		return fmt.Errorf("inconsistent private memory files on restore: savedMFOwners = %v, CtxFilesystemMemoryFileMap = %v", meta.owners, mfmap)
@@ -564,7 +614,7 @@ func loadPrivateMFs(ctx context.Context, r wire.Reader) error {
 		if !ok {
 			return fmt.Errorf("saved memory file for %q was not configured on restore", fsID)
 		}
-		if err := mf.LoadFrom(ctx, r); err != nil {
+		if err := mf.LoadFrom(ctx, r, pr); err != nil {
 			return err
 		}
 	}
@@ -574,7 +624,7 @@ func loadPrivateMFs(ctx context.Context, r wire.Reader) error {
 // SaveTo saves the state of k to w.
 //
 // Preconditions: The kernel must be paused throughout the call to SaveTo.
-func (k *Kernel) SaveTo(ctx context.Context, w wire.Writer) error {
+func (k *Kernel) SaveTo(ctx context.Context, w, pagesMetadata io.Writer, pagesFile *fd.FD, mfOpts pgalloc.SaveOpts) error {
 	saveStart := time.Now()
 
 	// Do not allow other Kernel methods to affect it while it's being saved.
@@ -595,8 +645,8 @@ func (k *Kernel) SaveTo(ctx context.Context, w wire.Writer) error {
 	}
 
 	// Capture all private memory files.
-	mfsToSave := make(map[vfs.RestoreID]*pgalloc.MemoryFile)
-	vfsCtx := context.WithValue(ctx, vfs.CtxFilesystemMemoryFileMap, mfsToSave)
+	mfsToSave := make(map[string]*pgalloc.MemoryFile)
+	vfsCtx := context.WithValue(ctx, pgalloc.CtxMemoryFileMap, mfsToSave)
 	// Prepare filesystems for saving. This must be done after
 	// invalidateUnsavableMappings(), since dropping memory mappings may
 	// affect filesystem state (e.g. page cache reference counts).
@@ -642,10 +692,18 @@ func (k *Kernel) SaveTo(ctx context.Context, w wire.Writer) error {
 
 	// Save the memory files' state.
 	memoryStart := time.Now()
-	if err := k.mf.SaveTo(ctx, w); err != nil {
+	pmw := w
+	if pagesMetadata != nil {
+		pmw = pagesMetadata
+	}
+	pw := w
+	if pagesFile != nil {
+		pw = pagesFile
+	}
+	if err := k.mf.SaveTo(ctx, pmw, pw, mfOpts); err != nil {
 		return err
 	}
-	if err := savePrivateMFs(ctx, w, mfsToSave); err != nil {
+	if err := savePrivateMFs(ctx, pmw, pw, mfsToSave, mfOpts); err != nil {
 		return err
 	}
 	log.Infof("Memory files save took [%s].", time.Since(memoryStart))
@@ -681,10 +739,28 @@ func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
 }
 
 // LoadFrom returns a new Kernel loaded from args.
-func (k *Kernel) LoadFrom(ctx context.Context, r wire.Reader, timeReady chan struct{}, net inet.Stack, clocks sentrytime.Clocks, vfsOpts *vfs.CompleteRestoreOptions) error {
+func (k *Kernel) LoadFrom(ctx context.Context, r, pagesMetadata io.Reader, pagesFile *fd.FD, timeReady chan struct{}, net inet.Stack, clocks sentrytime.Clocks, vfsOpts *vfs.CompleteRestoreOptions) error {
 	loadStart := time.Now()
 
+	var (
+		mfLoadWg  sync.WaitGroup
+		mfLoadErr error
+	)
+	parallelMfLoad := pagesMetadata != nil && pagesFile != nil
+	if parallelMfLoad {
+		// Parallelize MemoryFile load and kernel load. Both are independent.
+		mfLoadWg.Add(1)
+		go func() {
+			defer mfLoadWg.Done()
+			mfLoadErr = k.loadMemoryFiles(ctx, r, pagesMetadata, pagesFile)
+		}()
+		// Defer a Wait() so we wait for k.loadMemoryFiles() to complete even if we
+		// error out without reaching the other Wait() below.
+		defer mfLoadWg.Wait()
+	}
+
 	k.runningTasksCond.L = &k.runningTasksMu
+	k.checkpointCond.L = &k.checkpointMu
 	k.cpuClockTickerWakeCh = make(chan struct{}, 1)
 	k.cpuClockTickerStopCond.L = &k.runningTasksMu
 
@@ -717,30 +793,27 @@ func (k *Kernel) LoadFrom(ctx context.Context, r wire.Reader, timeReady chan str
 	log.Infof("Kernel load stats: %s", stats.String())
 	log.Infof("Kernel load took [%s].", time.Since(kernelStart))
 
+	if parallelMfLoad {
+		mfLoadWg.Wait()
+	} else {
+		mfLoadErr = k.loadMemoryFiles(ctx, r, pagesMetadata, pagesFile)
+	}
+	if mfLoadErr != nil {
+		return mfLoadErr
+	}
+
 	// rootNetworkNamespace should be populated after loading the state file.
 	// Restore the root network stack.
 	k.rootNetworkNamespace.RestoreRootStack(net)
 
-	// Load the memory files' state.
-	memoryStart := time.Now()
-	if err := k.mf.LoadFrom(ctx, r); err != nil {
-		return err
-	}
-	if err := loadPrivateMFs(ctx, r); err != nil {
-		return err
-	}
-	log.Infof("Memory files load took [%s].", time.Since(memoryStart))
-
-	log.Infof("Overall load took [%s]", time.Since(loadStart))
-
-	k.Timekeeper().SetClocks(clocks)
+	k.Timekeeper().SetClocks(clocks, k.vdsoParams)
 
 	if timeReady != nil {
 		close(timeReady)
 	}
 
 	if net != nil {
-		net.Resume()
+		net.Restore()
 	}
 
 	if err := k.vfs.CompleteRestore(ctx, vfsOpts); err != nil {
@@ -761,6 +834,33 @@ func (k *Kernel) LoadFrom(ctx context.Context, r wire.Reader, timeReady chan str
 		return fmt.Errorf("UseHostCores enabled: can't increase ApplicationCores from %d to %d after restore", k.applicationCores, initAppCores)
 	}
 
+	return nil
+}
+
+func (k *Kernel) loadMemoryFiles(ctx context.Context, r, pagesMetadata io.Reader, pagesFile *fd.FD) error {
+	// Load the memory files' state.
+	memoryStart := time.Now()
+	pmr := r
+	if pagesMetadata != nil {
+		pmr = pagesMetadata
+	}
+	var pr *statefile.AsyncReader
+	if pagesFile != nil {
+		pr = statefile.NewAsyncReader(pagesFile, 0 /* off */)
+		defer pr.Close()
+	}
+	if err := k.mf.LoadFrom(ctx, pmr, pr); err != nil {
+		return err
+	}
+	if err := loadPrivateMFs(ctx, pmr, pr); err != nil {
+		return err
+	}
+	if pr != nil {
+		if err := pr.Wait(); err != nil {
+			return err
+		}
+	}
+	log.Infof("Memory files load took [%s].", time.Since(memoryStart))
 	return nil
 }
 
@@ -835,6 +935,9 @@ type CreateProcessArgs struct {
 
 	// InitialCgroups are the cgroups the container is initialized to.
 	InitialCgroups map[Cgroup]struct{}
+
+	// Origin indicates how the task was first created.
+	Origin TaskOrigin
 }
 
 // NewContext returns a context.Context that represents the task that will be
@@ -886,7 +989,7 @@ func (ctx *createProcessContext) Value(key any) any {
 		mntns.IncRef()
 		return mntns
 	case devutil.CtxDevGoferClient:
-		return ctx.kernel.getDevGoferClient(ctx.args.ContainerID)
+		return ctx.kernel.GetDevGoferClient(ctx.kernel.ContainerName(ctx.args.ContainerID))
 	case inet.CtxStack:
 		return ctx.kernel.RootNetworkNamespace().Stack()
 	case ktime.CtxRealtimeClock:
@@ -897,8 +1000,6 @@ func (ctx *createProcessContext) Value(key any) any {
 		return ctx.getMemoryCgroupID()
 	case pgalloc.CtxMemoryFile:
 		return ctx.kernel.mf
-	case pgalloc.CtxMemoryFileProvider:
-		return ctx.kernel
 	case platform.CtxPlatform:
 		return ctx.kernel
 	case uniqueid.CtxGlobalUniqueID:
@@ -1025,9 +1126,18 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	if se != nil {
 		return nil, 0, errors.New(se.String())
 	}
-
-	// Take a reference on the FDTable, which will be transferred to
-	// TaskSet.NewTask().
+	var capData auth.VfsCapData
+	if len(image.FileCaps()) != 0 {
+		var err error
+		capData, err = auth.VfsCapDataOf([]byte(image.FileCaps()))
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	creds, err := auth.CapsFromVfsCaps(capData, args.Credentials)
+	if err != nil {
+		return nil, 0, err
+	}
 	args.FDTable.IncRef()
 
 	// Create the task.
@@ -1037,7 +1147,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		TaskImage:        image,
 		FSContext:        fsContext,
 		FDTable:          args.FDTable,
-		Credentials:      args.Credentials,
+		Credentials:      creds,
 		NetworkNamespace: k.RootNetworkNamespace(),
 		AllowedCPUMask:   sched.NewFullCPUSet(k.applicationCores),
 		UTSNamespace:     args.UTSNamespace,
@@ -1046,6 +1156,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		ContainerID:      args.ContainerID,
 		InitialCgroups:   args.InitialCgroups,
 		UserCounters:     k.GetUserCounters(args.Credentials.RealKUID),
+		Origin:           args.Origin,
 		// A task with no parent starts out with no session keyring.
 		SessionKeyring: nil,
 	}
@@ -1145,10 +1256,11 @@ func (k *Kernel) pauseTimeLocked(ctx context.Context) {
 		// This means we'll iterate FDTables shared by multiple tasks repeatedly,
 		// but ktime.Timer.Pause is idempotent so this is harmless.
 		if t.fdTable != nil {
-			t.fdTable.forEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) {
+			t.fdTable.ForEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) bool {
 				if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
 					tfd.PauseTimer()
 				}
+				return true
 			})
 		}
 	}
@@ -1166,7 +1278,7 @@ func (k *Kernel) resumeTimeLocked(ctx context.Context) {
 	// The CPU clock ticker will automatically resume as task goroutines resume
 	// execution.
 
-	k.timekeeper.ResumeUpdates()
+	k.timekeeper.ResumeUpdates(k.vdsoParams)
 	for t := range k.tasks.Root.tids {
 		if t == t.tg.leader {
 			t.tg.itimerRealTimer.Resume()
@@ -1175,10 +1287,11 @@ func (k *Kernel) resumeTimeLocked(ctx context.Context) {
 			}
 		}
 		if t.fdTable != nil {
-			t.fdTable.forEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) {
+			t.fdTable.ForEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) bool {
 				if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
 					tfd.ResumeTimer()
 				}
+				return true
 			})
 		}
 	}
@@ -1257,9 +1370,15 @@ func (k *Kernel) decRunningTasks() {
 	// active without an expensive transition.
 }
 
-// WaitExited blocks until all tasks in k have exited.
+// WaitExited blocks until all tasks in k have exited. No tasks can be created
+// after WaitExited returns.
 func (k *Kernel) WaitExited() {
-	k.tasks.liveGoroutines.Wait()
+	k.tasks.mu.Lock()
+	defer k.tasks.mu.Unlock()
+	k.tasks.noNewTasksIfZeroLive = true
+	for k.tasks.liveTasks != 0 {
+		k.tasks.zeroLiveTasksCond.Wait()
+	}
 }
 
 // Kill requests that all tasks in k immediately exit as if group exiting with
@@ -1280,6 +1399,11 @@ func (k *Kernel) Pause() {
 	k.extMu.Unlock()
 	k.tasks.runningGoroutines.Wait()
 	k.tasks.aioGoroutines.Wait()
+}
+
+// IsPaused returns true if the kernel is currently paused.
+func (k *Kernel) IsPaused() bool {
+	return k.tasks.isExternallyStopped()
 }
 
 // ReceiveTaskStates receives full states for all tasks.
@@ -1536,7 +1660,7 @@ func (k *Kernel) SetMemoryFile(mf *pgalloc.MemoryFile) {
 	k.mf = mf
 }
 
-// MemoryFile implements pgalloc.MemoryFileProvider.MemoryFile.
+// MemoryFile returns the MemoryFile that provides application memory.
 func (k *Kernel) MemoryFile() *pgalloc.MemoryFile {
 	return k.mf
 }
@@ -1674,8 +1798,6 @@ func (ctx *supervisorContext) Value(key any) any {
 		return limits.NewLimitSet()
 	case pgalloc.CtxMemoryFile:
 		return ctx.Kernel.mf
-	case pgalloc.CtxMemoryFileProvider:
-		return ctx.Kernel
 	case platform.CtxPlatform:
 		return ctx.Kernel
 	case uniqueid.CtxGlobalUniqueID:
@@ -1725,6 +1847,28 @@ func (k *Kernel) SetHostMount(mnt *vfs.Mount) {
 		panic("Kernel.hostMount cannot be set more than once")
 	}
 	k.hostMount = mnt
+}
+
+// AddStateToCheckpoint adds a key-value pair to be additionally checkpointed.
+func (k *Kernel) AddStateToCheckpoint(key, v any) {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	if k.additionalCheckpointState == nil {
+		k.additionalCheckpointState = make(map[any]any)
+	}
+	k.additionalCheckpointState[key] = v
+}
+
+// PopCheckpointState pops a key-value pair from the additional checkpoint
+// state. If the key doesn't exist, nil is returned.
+func (k *Kernel) PopCheckpointState(key any) any {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	if v, ok := k.additionalCheckpointState[key]; ok {
+		delete(k.additionalCheckpointState, key)
+		return v
+	}
+	return nil
 }
 
 // HostMount returns the hostfs mount.
@@ -1809,6 +1953,7 @@ func (k *Kernel) Release() {
 	k.rootIPCNamespace.DecRef(ctx)
 	k.rootUTSNamespace.DecRef(ctx)
 	k.cleaupDevGofers()
+	k.mf.Destroy()
 }
 
 // PopulateNewCgroupHierarchy moves all tasks into a newly created cgroup
@@ -1913,8 +2058,8 @@ func (k *Kernel) GetUserCounters(uid auth.KUID) *UserCounters {
 
 // AddDevGofer initializes the dev gofer connection and starts tracking it.
 // It takes ownership of goferFD.
-func (k *Kernel) AddDevGofer(cid string, goferFD int) error {
-	client, err := devutil.NewGoferClient(k.SupervisorContext(), goferFD)
+func (k *Kernel) AddDevGofer(contName string, goferFD int) error {
+	client, err := devutil.NewGoferClient(k.SupervisorContext(), contName, goferFD)
 	if err != nil {
 		return err
 	}
@@ -1924,27 +2069,29 @@ func (k *Kernel) AddDevGofer(cid string, goferFD int) error {
 	if k.devGofers == nil {
 		k.devGofers = make(map[string]*devutil.GoferClient)
 	}
-	k.devGofers[cid] = client
+	k.devGofers[contName] = client
 	return nil
 }
 
 // RemoveDevGofer closes the dev gofer connection, if one exists, and stops
 // tracking it.
-func (k *Kernel) RemoveDevGofer(cid string) {
+func (k *Kernel) RemoveDevGofer(contName string) {
 	k.devGofersMu.Lock()
 	defer k.devGofersMu.Unlock()
-	client, ok := k.devGofers[cid]
+	client, ok := k.devGofers[contName]
 	if !ok {
 		return
 	}
 	client.Close()
-	delete(k.devGofers, cid)
+	delete(k.devGofers, contName)
 }
 
-func (k *Kernel) getDevGoferClient(cid string) *devutil.GoferClient {
+// GetDevGoferClient implements
+// devutil.GoferClientProviderFromContext.GetDevGoferClient.
+func (k *Kernel) GetDevGoferClient(contName string) *devutil.GoferClient {
 	k.devGofersMu.Lock()
 	defer k.devGofersMu.Unlock()
-	return k.devGofers[cid]
+	return k.devGofers[contName]
 }
 
 func (k *Kernel) cleaupDevGofers() {
@@ -1954,4 +2101,108 @@ func (k *Kernel) cleaupDevGofers() {
 		client.Close()
 	}
 	k.devGofers = nil
+}
+
+// RegisterContainerName registers a container name for a given container ID.
+func (k *Kernel) RegisterContainerName(cid, containerName string) {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	k.containerNames[cid] = containerName
+}
+
+// RestoreContainerMapping remaps old container IDs to new ones after a restore.
+// containerIDs maps "name -> new container ID". Note that container names remain
+// constant between restore sessions.
+func (k *Kernel) RestoreContainerMapping(containerIDs map[string]string) {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+
+	// Delete mapping from old session and replace with new values.
+	k.containerNames = make(map[string]string)
+	for name, cid := range containerIDs {
+		k.containerNames[cid] = name
+	}
+}
+
+// ContainerName returns the container name for a given container ID.
+func (k *Kernel) ContainerName(cid string) string {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	return k.containerNames[cid]
+}
+
+// SetSaver sets the kernel's Saver.
+// Thread-compatible.
+func (k *Kernel) SetSaver(s Saver) {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	k.saver = s
+}
+
+// Saver returns the kernel's Saver.
+// Thread-compatible.
+func (k *Kernel) Saver() Saver {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	return k.saver
+}
+
+// IncCheckpointCount increments the checkpoint counter.
+func (k *Kernel) IncCheckpointCount() {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	k.checkpointCounter++
+}
+
+// CheckpointCount returns the current checkpoint count. Note that the result
+// may be stale by the time the caller uses it.
+func (k *Kernel) CheckpointCount() uint32 {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	return k.checkpointCounter
+}
+
+// OnCheckpointAttempt is called when a checkpoint attempt is completed. err is
+// any checkpoint errors that may have occurred.
+func (k *Kernel) OnCheckpointAttempt(err error) {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	if err == nil {
+		k.checkpointCounter++
+	}
+	k.lastCheckpointStatus = err
+	k.checkpointCond.Broadcast()
+}
+
+// ResetCheckpointStatus resets the last checkpoint status, indicating a new
+// checkpoint is in progress. Caller must call OnCheckpointAttempt when the
+// checkpoint attempt is completed.
+func (k *Kernel) ResetCheckpointStatus() {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	k.lastCheckpointStatus = nil
+}
+
+// WaitCheckpoint waits for the Kernel to have been successfully checkpointed
+// n-1 times, then waits for either the n-th successful checkpoint (in which
+// case it returns nil) or any number of failed checkpoints (in which case it
+// returns an error returned by any such failure).
+func (k *Kernel) WaitCheckpoint(n uint32) error {
+	if n == 0 {
+		return nil
+	}
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	if k.checkpointCounter >= n {
+		// n-th checkpoint already completed successfully.
+		return nil
+	}
+	for k.checkpointCounter < n {
+		if k.checkpointCounter == n-1 && k.lastCheckpointStatus != nil {
+			// n-th checkpoint was attempted but it had failed.
+			return k.lastCheckpointStatus
+		}
+		k.checkpointCond.Wait()
+	}
+	return nil
 }

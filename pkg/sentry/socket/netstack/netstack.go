@@ -80,13 +80,21 @@ func statCounterValue(cm *tcpip.StatCounter) func(...*metric.FieldValue) uint64 
 
 func mustCreateMetric(name, description string) *tcpip.StatCounter {
 	var cm tcpip.StatCounter
-	metric.MustRegisterCustomUint64Metric(name, true /* cumulative */, false /* sync */, description, statCounterValue(&cm))
+	metric.MustRegisterCustomUint64Metric(name,
+		metric.Uint64Metadata{
+			Cumulative:  true,
+			Description: description,
+		}, statCounterValue(&cm))
 	return &cm
 }
 
 func mustCreateGauge(name, description string) *tcpip.StatCounter {
 	var cm tcpip.StatCounter
-	metric.MustRegisterCustomUint64Metric(name, false /* cumulative */, false /* sync */, description, statCounterValue(&cm))
+	metric.MustRegisterCustomUint64Metric(name,
+		metric.Uint64Metadata{
+			Cumulative:  false,
+			Description: description,
+		}, statCounterValue(&cm))
 	return &cm
 }
 
@@ -366,6 +374,11 @@ type sock struct {
 
 	namespace *inet.Namespace
 
+	mu sync.Mutex `state:"nosave"`
+	// readWriter is an optimization to avoid allocations.
+	// +checklocks:mu
+	readWriter usermem.IOSequenceReadWriter `state:"nosave"`
+
 	// readMu protects access to the below fields.
 	readMu sync.Mutex `state:"nosave"`
 
@@ -482,8 +495,17 @@ func (s *sock) Write(ctx context.Context, src usermem.IOSequence, opts vfs.Write
 		return 0, linuxerr.EOPNOTSUPP
 	}
 
-	r := src.Reader(ctx)
-	n, err := s.Endpoint.Write(r, tcpip.WriteOptions{})
+	var n int64
+	var err tcpip.Error
+	switch s.Endpoint.(type) {
+	case *tcp.Endpoint:
+		s.mu.Lock()
+		s.readWriter.Init(ctx, src)
+		n, err = s.Endpoint.Write(&s.readWriter, tcpip.WriteOptions{})
+		s.mu.Unlock()
+	default:
+		n, err = s.Endpoint.Write(src.Reader(ctx), tcpip.WriteOptions{})
+	}
 	if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 		return 0, linuxerr.ErrWouldBlock
 	}
@@ -1187,8 +1209,6 @@ func getSockOptTCP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name, out
 			return nil, syserr.TranslateNetstackError(err)
 		}
 
-		// TODO(b/64800844): Translate fields once they are added to
-		// tcpip.TCPInfoOption.
 		info := linux.TCPInfo{
 			State:       uint8(v.State),
 			RTO:         uint32(v.RTO / time.Microsecond),
@@ -1552,7 +1572,7 @@ func getSockOptIPv6(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int
 // getSockOptIP implements GetSockOpt when level is SOL_IP.
 func getSockOptIP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, outPtr hostarch.Addr, outLen int, _ int) (marshal.Marshallable, *syserr.Error) {
 	if _, ok := ep.(tcpip.Endpoint); !ok {
-		log.Warningf("SOL_IP options not supported on endpoints other than tcpip.Endpoint: option = %d", name)
+		log.Warningf("SOL_IP options not supported on endpoints other than tcpip.Endpoint: option = %d, endpoint = %T", name, ep)
 		return nil, syserr.ErrUnknownProtocolOption
 	}
 
@@ -1750,6 +1770,30 @@ func getSockOptIP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, 
 			return nil, err
 		}
 		return &ret, nil
+
+	case linux.IP_MTU_DISCOVER:
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		v, err := ep.GetSockOptInt(tcpip.MTUDiscoverOption)
+		if err != nil {
+			return nil, syserr.TranslateNetstackError(err)
+		}
+		switch tcpip.PMTUDStrategy(v) {
+		case tcpip.PMTUDiscoveryWant:
+			v = linux.IP_PMTUDISC_WANT
+		case tcpip.PMTUDiscoveryDont:
+			v = linux.IP_PMTUDISC_DONT
+		case tcpip.PMTUDiscoveryDo:
+			v = linux.IP_PMTUDISC_DO
+		case tcpip.PMTUDiscoveryProbe:
+			v = linux.IP_PMTUDISC_PROBE
+		default:
+			panic(fmt.Errorf("unknown PMTUD option: %d", v))
+		}
+		vP := primitive.Int32(v)
+		return &vP, nil
 	}
 	return nil, syserr.ErrProtocolNotAvailable
 }
@@ -2386,7 +2430,7 @@ func parseIntOrChar(buf []byte) (int32, *syserr.Error) {
 // setSockOptIP implements SetSockOpt when level is SOL_IP.
 func setSockOptIP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
 	if _, ok := ep.(tcpip.Endpoint); !ok {
-		log.Warningf("SOL_IP options not supported on endpoints other than tcpip.Endpoint: option = %d", name)
+		log.Warningf("SOL_IP options not supported on endpoints other than tcpip.Endpoint: option = %d, endpoint = %T", name, ep)
 		return syserr.ErrUnknownProtocolOption
 	}
 
@@ -2564,6 +2608,30 @@ func setSockOptIP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, 
 		log.Infof("IPT_SO_SET_ADD_COUNTERS is not supported")
 		return nil
 
+	case linux.IP_MTU_DISCOVER:
+		if len(optVal) == 0 {
+			return nil
+		}
+		v, err := parseIntOrChar(optVal)
+		if err != nil {
+			return err
+		}
+		switch v {
+		case linux.IP_PMTUDISC_DONT:
+			v = int32(tcpip.PMTUDiscoveryDont)
+		case linux.IP_PMTUDISC_WANT:
+			v = int32(tcpip.PMTUDiscoveryWant)
+		case linux.IP_PMTUDISC_DO:
+			v = int32(tcpip.PMTUDiscoveryDo)
+		case linux.IP_PMTUDISC_PROBE:
+			v = int32(tcpip.PMTUDiscoveryProbe)
+		case linux.IP_PMTUDISC_INTERFACE, linux.IP_PMTUDISC_OMIT:
+			return nil // Noop.
+		default:
+			return syserr.ErrNotSupported
+		}
+		return syserr.TranslateNetstackError(ep.SetSockOptInt(tcpip.MTUDiscoverOption, int(v)))
+
 	case linux.IP_ADD_SOURCE_MEMBERSHIP,
 		linux.IP_BIND_ADDRESS_NO_PORT,
 		linux.IP_BLOCK_SOURCE,
@@ -2573,7 +2641,6 @@ func setSockOptIP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, 
 		linux.IP_IPSEC_POLICY,
 		linux.IP_MINTTL,
 		linux.IP_MSFILTER,
-		linux.IP_MTU_DISCOVER,
 		linux.IP_MULTICAST_ALL,
 		linux.IP_NODEFRAG,
 		linux.IP_OPTIONS,
@@ -2670,19 +2737,30 @@ func (s *sock) nonBlockingRead(ctx context.Context, dst usermem.IOSequence, peek
 	// bytes of data to be discarded, rather than passed back in a
 	// caller-supplied  buffer.
 	var w io.Writer
+	var res tcpip.ReadResult
+	var err tcpip.Error
+
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+
 	if !isPacket && trunc {
 		w = &tcpip.LimitedWriter{
 			W: ioutil.Discard,
 			N: dst.NumBytes(),
 		}
+		res, err = s.Endpoint.Read(w, readOptions)
 	} else {
-		w = dst.Writer(ctx)
+		switch s.Endpoint.(type) {
+		case *tcp.Endpoint:
+			s.mu.Lock()
+			s.readWriter.Init(ctx, dst)
+			res, err = s.Endpoint.Read(&s.readWriter, readOptions)
+			s.mu.Unlock()
+		default:
+			res, err = s.Endpoint.Read(dst.Writer(ctx), readOptions)
+		}
 	}
 
-	s.readMu.Lock()
-	defer s.readMu.Unlock()
-
-	res, err := s.Endpoint.Read(w, readOptions)
 	if _, ok := err.(*tcpip.ErrBadBuffer); ok && dst.NumBytes() == 0 {
 		err = nil
 	}
@@ -3384,9 +3462,9 @@ func (s *sock) State() uint32 {
 			return 0
 		}
 	case socket.IsICMP(s):
-		// TODO(b/112063468): Export states for ICMP sockets.
+		// We don't support this yet.
 	case socket.IsRaw(s):
-		// TODO(b/112063468): Export states for raw sockets.
+		// We don't support this yet.
 	default:
 		// Unknown transport protocol, how did we make this socket?
 		log.Warningf("Unknown transport protocol for an existing socket: family=%v, type=%v, protocol=%v, internal type %v", s.family, s.skType, s.protocol, reflect.TypeOf(s.Endpoint).Elem())

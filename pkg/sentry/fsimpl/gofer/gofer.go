@@ -81,6 +81,7 @@ const (
 	moptDfltUID                  = "dfltuid"
 	moptDfltGID                  = "dfltgid"
 	moptCache                    = "cache"
+	moptDcache                   = "dcache"
 	moptForcePageCache           = "force_page_cache"
 	moptLimitHostFDTranslation   = "limit_host_fd_translation"
 	moptOverlayfsStaleRead       = "overlayfs_stale_read"
@@ -99,7 +100,7 @@ const (
 )
 
 // SupportedMountOptions is the set of mount options that can be set externally.
-var SupportedMountOptions = []string{moptOverlayfsStaleRead, moptDisableFileHandleSharing}
+var SupportedMountOptions = []string{moptOverlayfsStaleRead, moptDisableFileHandleSharing, moptDcache}
 
 const (
 	defaultMaxCachedDentries  = 1000
@@ -143,6 +144,9 @@ func (cache *stringFixedCache) add(name string) string {
 
 // +stateify savable
 type dentryCache struct {
+	// maxCachedDentries is the maximum number of cacheable dentries.
+	// maxCachedDentries is immutable.
+	maxCachedDentries uint64
 	// mu protects the below fields.
 	mu sync.Mutex `state:"nosave"`
 	// dentries contains all dentries with 0 references. Due to race conditions,
@@ -150,8 +154,6 @@ type dentryCache struct {
 	dentries dentryList
 	// dentriesLen is the number of dentries in dentries.
 	dentriesLen uint64
-	// maxCachedDentries is the maximum number of cacheable dentries.
-	maxCachedDentries uint64
 }
 
 // SetDentryCacheSize sets the size of the global gofer dentry cache.
@@ -166,7 +168,7 @@ func SetDentryCacheSize(size int) {
 	globalDentryCache = &dentryCache{maxCachedDentries: uint64(size)}
 }
 
-// globalDentryCache is a global cache of dentries across all gofers.
+// globalDentryCache is a global cache of dentries across all gofer clients.
 var globalDentryCache *dentryCache
 
 // Valid values for "trans" mount option.
@@ -183,9 +185,9 @@ type FilesystemType struct{}
 type filesystem struct {
 	vfsfs vfs.Filesystem
 
-	// mfp is used to allocate memory that caches regular file contents. mfp is
+	// mf is used to allocate memory that caches regular file contents. mf is
 	// immutable.
-	mfp pgalloc.MemoryFileProvider
+	mf *pgalloc.MemoryFile `state:"nosave"`
 
 	// Immutable options.
 	opts  filesystemOptions
@@ -250,6 +252,10 @@ type filesystemOptions struct {
 	interop InteropMode // derived from the "cache" mount option
 	dfltuid auth.KUID
 	dfltgid auth.KGID
+
+	// dcache is the maximum number of dentries that can be cached. This is
+	// effective only if globalDentryCache is not being used.
+	dcache uint64
 
 	// If forcePageCache is true, host FDs may not be used for application
 	// memory mappings even if available; instead, the client must perform its
@@ -373,6 +379,9 @@ type InternalFilesystemOptions struct {
 
 	// If OpenSocketsByConnecting is true, silently translate attempts to open
 	// files identifying as sockets to connect RPCs.
+	//
+	// TODO(b/354724938): Remove this option once there are no callers who
+	// rely on this behavior.
 	OpenSocketsByConnecting bool
 }
 
@@ -395,9 +404,9 @@ func (FilesystemType) Release(ctx context.Context) {}
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
-	mfp := pgalloc.MemoryFileProviderFromContext(ctx)
-	if mfp == nil {
-		ctx.Warningf("gofer.FilesystemType.GetFilesystem: context does not provide a pgalloc.MemoryFileProvider")
+	mf := pgalloc.MemoryFileFromContext(ctx)
+	if mf == nil {
+		ctx.Warningf("gofer.FilesystemType.GetFilesystem: CtxMemoryFile is nil")
 		return nil, nil, linuxerr.EINVAL
 	}
 
@@ -436,6 +445,20 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		default:
 			ctx.Warningf("gofer.FilesystemType.GetFilesystem: invalid cache policy: %s=%s", moptCache, cache)
 			return nil, nil, linuxerr.EINVAL
+		}
+	}
+
+	// Parse the dentry cache size.
+	fsopts.dcache = defaultMaxCachedDentries
+	if dcacheStr, ok := mopts[moptDcache]; ok {
+		delete(mopts, moptDcache)
+		dcache, err := strconv.ParseInt(dcacheStr, 10, 64)
+		if err != nil {
+			ctx.Warningf("gofer.FilesystemType.GetFilesystem: invalid dcache: %s=%s", moptDcache, dcacheStr)
+			return nil, nil, linuxerr.EINVAL
+		}
+		if dcache >= 0 {
+			fsopts.dcache = uint64(dcache)
 		}
 	}
 
@@ -522,7 +545,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, err
 	}
 	fs := &filesystem{
-		mfp:      mfp,
+		mf:       mf,
 		opts:     fsopts,
 		iopts:    iopts,
 		clock:    ktime.RealtimeClockFromContext(ctx),
@@ -534,7 +557,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	if globalDentryCache != nil {
 		fs.dentryCache = globalDentryCache
 	} else {
-		fs.dentryCache = &dentryCache{maxCachedDentries: defaultMaxCachedDentries}
+		fs.dentryCache = &dentryCache{maxCachedDentries: fsopts.dcache}
 	}
 
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
@@ -660,7 +683,7 @@ func getFDFromMountOptionsMap(ctx context.Context, mopts map[string]string) (int
 func (fs *filesystem) Release(ctx context.Context) {
 	fs.released.Store(1)
 
-	mf := fs.mfp.MemoryFile()
+	mf := fs.mf
 	fs.syncMu.Lock()
 	for elem := fs.syncableDentries.Front(); elem != nil; elem = elem.Next() {
 		d := elem.d
@@ -833,15 +856,17 @@ type dentry struct {
 	children map[string]*dentry
 
 	// If this dentry represents a directory, negativeChildrenCache cache
-	// names of negative children.
+	// names of negative children. negativeChildrenCache is not saved since
+	// dentry.prepareSaveRecursive() drops all negative children.
 	//
 	// +checklocks:childrenMu
-	negativeChildrenCache stringFixedCache
-	// If this dentry represents a directory, negativeChildren is the number
-	// of negative children cached in dentry.children
+	negativeChildrenCache stringFixedCache `state:"nosave"`
+	// If this dentry represents a directory, negativeChildren is the number of
+	// negative children cached in dentry.children. negativeChildren is not
+	// saved since dentry.prepareSaveRecursive() drops all negative children.
 	//
 	// +checklocks:childrenMu
-	negativeChildren int
+	negativeChildren int `state:"nosave"`
 
 	// If this dentry represents a directory, syntheticChildren is the number
 	// of child dentries for which dentry.isSynthetic() == true.
@@ -857,9 +882,9 @@ type dentry struct {
 	// childrenSet share the same lifecycle.
 	//
 	// +checklocks:childrenMu
-	dirents []vfs.Dirent
+	dirents []vfs.Dirent `state:"nosave"`
 	// +checklocks:childrenMu
-	childrenSet map[string]struct{}
+	childrenSet map[string]struct{} `state:"nosave"`
 
 	// Cached metadata; protected by metadataMu.
 	// To access:
@@ -973,6 +998,11 @@ type dentry struct {
 	// same underlying file (see the gofer filesystem section fo vfs/inotify.md for
 	// a more in-depth discussion on this matter).
 	watches vfs.Watches
+
+	// forMountpoint marks directories that were created for mount points during
+	// container startup. This is used during restore, in case these mount points
+	// need to be recreated.
+	forMountpoint bool
 
 	// impl is the specific dentry implementation for non-synthetic dentries.
 	// impl is immutable.
@@ -1383,7 +1413,7 @@ func (d *dentry) updateSizeAndUnlockDataMuLocked(newSize uint64) {
 		// truncated pages have been removed from the remote file, they
 		// should be dropped without being written back.
 		d.dataMu.Lock()
-		d.cache.Truncate(newSize, d.fs.mfp.MemoryFile())
+		d.cache.Truncate(newSize, d.fs.mf)
 		d.dirty.KeepClean(memmap.MappableRange{newSize, oldpgend})
 		d.dataMu.Unlock()
 	}
@@ -1756,7 +1786,7 @@ func (d *dentry) evictLocked(ctx context.Context) {
 // destroyDisconnected destroys an uncached, unparented dentry. There are no
 // locking preconditions.
 func (d *dentry) destroyDisconnected(ctx context.Context) {
-	mf := d.fs.mfp.MemoryFile()
+	mf := d.fs.mf
 
 	d.handleMu.Lock()
 	d.dataMu.Lock()
@@ -2078,7 +2108,7 @@ func (d *dentry) syncCachedFile(ctx context.Context, forFilesystemSync bool) err
 		// Write back dirty pages to the remote file.
 		d.dataMu.Lock()
 		h := d.writeHandle()
-		err := fsutil.SyncDirtyAll(ctx, &d.cache, &d.dirty, d.size.Load(), d.fs.mfp.MemoryFile(), h.writeFromBlocksAt)
+		err := fsutil.SyncDirtyAll(ctx, &d.cache, &d.dirty, d.size.Load(), d.fs.mf, h.writeFromBlocksAt)
 		d.dataMu.Unlock()
 		if err != nil {
 			return err

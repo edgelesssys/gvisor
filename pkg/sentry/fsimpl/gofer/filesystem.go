@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
@@ -809,6 +810,10 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		if d.nlink.Load() == math.MaxUint32 {
 			return nil, linuxerr.EMLINK
 		}
+		if d.isSynthetic() {
+			// TODO(gvisor.dev/issue/6739): Add synthetic file hard link support.
+			return nil, linuxerr.EOPNOTSUPP
+		}
 		return parent.link(ctx, d, name)
 	}, nil)
 
@@ -837,6 +842,7 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 			if fs.opts.interop != InteropModeShared {
 				parent.incLinks()
 			}
+			child.forMountpoint = opts.ForSyntheticMountpoint
 			return child, nil
 		}
 
@@ -1044,6 +1050,9 @@ afterTrailingSymlink:
 	return child.open(ctx, rp, &opts)
 }
 
+// Used to log a rejected fifo open, once.
+var logRejectedFifoOpenOnce sync.Once
+
 // Preconditions: The caller must hold no locks (since opening pipes may block
 // indefinitely).
 func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
@@ -1128,6 +1137,9 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			return d.pipe.Open(ctx, mnt, &d.vfsd, opts.Flags, &d.locks)
 		}
 		if d.fs.opts.disableFifoOpen {
+			logRejectedFifoOpenOnce.Do(func() {
+				log.Warningf("Rejecting attempt to open fifo/pipe from host filesystem: %q. If you want to allow this, set flag --host-fifo=open", d.name)
+			})
 			return nil, linuxerr.EPERM
 		}
 	}
@@ -1154,6 +1166,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 
 // Precondition: fs.renameMu is locked.
 func (d *dentry) openSocketByConnecting(ctx context.Context, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
+	fsmetric.GoferOpensByConnecting.Increment()
 	if opts.Flags&linux.O_DIRECT != 0 {
 		return nil, linuxerr.EINVAL
 	}
@@ -1753,6 +1766,11 @@ func (fs *filesystem) MountOptions() string {
 		{moptDfltGID, fs.opts.dfltgid},
 	}
 
+	if globalDentryCache != nil {
+		optsKV = append(optsKV, mopt{moptDcache, fmt.Sprintf("%d-global", globalDentryCache.maxCachedDentries)})
+	} else {
+		optsKV = append(optsKV, mopt{moptDcache, fs.opts.dcache})
+	}
 	switch fs.opts.interop {
 	case InteropModeExclusive:
 		optsKV = append(optsKV, mopt{moptCache, cacheFSCache})

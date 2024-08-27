@@ -86,10 +86,11 @@ const (
 	ccCubic = "cubic"
 )
 
+// +stateify savable
 type protocol struct {
 	stack *stack.Stack
 
-	mu                         sync.RWMutex
+	mu                         sync.RWMutex `state:"nosave"`
 	sackEnabled                bool
 	recovery                   tcpip.TCPRecovery
 	delayEnabled               bool
@@ -145,7 +146,7 @@ func (*protocol) ParsePorts(v []byte) (src, dst uint16, err tcpip.Error) {
 // to a specific processing queue. Each queue is serviced by its own processor
 // goroutine which is responsible for dequeuing and doing full TCP dispatch of
 // the packet.
-func (p *protocol) QueuePacket(ep stack.TransportEndpoint, id stack.TransportEndpointID, pkt stack.PacketBufferPtr) {
+func (p *protocol) QueuePacket(ep stack.TransportEndpoint, id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
 	p.dispatcher.queuePacket(ep, id, p.stack.Clock(), pkt)
 }
 
@@ -156,7 +157,7 @@ func (p *protocol) QueuePacket(ep stack.TransportEndpoint, id stack.TransportEnd
 // a reset is sent in response to any incoming segment except another reset. In
 // particular, SYNs addressed to a non-existent connection are rejected by this
 // means."
-func (p *protocol) HandleUnknownDestinationPacket(id stack.TransportEndpointID, pkt stack.PacketBufferPtr) stack.UnknownDestinationPacketDisposition {
+func (p *protocol) HandleUnknownDestinationPacket(id stack.TransportEndpointID, pkt *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
 	s, err := newIncomingSegment(id, p.stack.Clock(), pkt)
 	if err != nil {
 		return stack.UnknownDestinationPacketMalformed
@@ -480,6 +481,13 @@ func (p *protocol) Option(option tcpip.GettableTransportProtocolOption) tcpip.Er
 	}
 }
 
+// SendBufferSize implements stack.SendBufSizeProto.
+func (p *protocol) SendBufferSize() tcpip.TCPSendBufferSizeRangeOption {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.sendBufferSize
+}
+
 // Close implements stack.TransportProtocol.Close.
 func (p *protocol) Close() {
 	p.dispatcher.close()
@@ -501,12 +509,24 @@ func (p *protocol) Resume() {
 }
 
 // Parse implements stack.TransportProtocol.Parse.
-func (*protocol) Parse(pkt stack.PacketBufferPtr) bool {
+func (*protocol) Parse(pkt *stack.PacketBuffer) bool {
 	return parse.TCP(pkt)
 }
 
-// NewProtocol returns a TCP transport protocol.
+// NewProtocol returns a TCP transport protocol with Reno congestion control.
 func NewProtocol(s *stack.Stack) stack.TransportProtocol {
+	return newProtocol(s, ccReno)
+}
+
+// NewProtocolCUBIC returns a TCP transport protocol with CUBIC congestion
+// control.
+//
+// TODO(b/345835636): Remove this and make CUBIC the default across the board.
+func NewProtocolCUBIC(s *stack.Stack) stack.TransportProtocol {
+	return newProtocol(s, ccCubic)
+}
+
+func newProtocol(s *stack.Stack, cc string) stack.TransportProtocol {
 	rng := s.SecureRNG()
 	var seqnumSecret [16]byte
 	var tsOffsetSecret [16]byte
@@ -528,7 +548,8 @@ func NewProtocol(s *stack.Stack) stack.TransportProtocol {
 			Default: DefaultReceiveBufferSize,
 			Max:     MaxBufferSize,
 		},
-		congestionControl:          ccReno,
+		sackEnabled:                true,
+		congestionControl:          cc,
 		availableCongestionControl: []string{ccReno, ccCubic},
 		moderateReceiveBuffer:      true,
 		lingerTimeout:              DefaultTCPLingerTimeout,

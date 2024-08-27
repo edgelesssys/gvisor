@@ -14,14 +14,6 @@
 
 package nvgpu
 
-// HasRMCtrlFD is a type constraint for UVM parameter structs containing a
-// RMCtrlFD field. This is necessary because, as of this writing (Go 1.20),
-// there is no way to enable field access using a Go type constraint.
-type HasRMCtrlFD interface {
-	GetRMCtrlFD() int32
-	SetRMCtrlFD(int32)
-}
-
 // UVM ioctl commands.
 const (
 	// From kernel-open/nvidia-uvm/uvm_linux_ioctl.h:
@@ -35,14 +27,24 @@ const (
 	UVM_UNREGISTER_GPU_VASPACE         = 26
 	UVM_REGISTER_CHANNEL               = 27
 	UVM_UNREGISTER_CHANNEL             = 28
+	UVM_ENABLE_PEER_ACCESS             = 29
+	UVM_DISABLE_PEER_ACCESS            = 30
+	UVM_SET_RANGE_GROUP                = 31
 	UVM_MAP_EXTERNAL_ALLOCATION        = 33
 	UVM_FREE                           = 34
 	UVM_REGISTER_GPU                   = 37
 	UVM_UNREGISTER_GPU                 = 38
 	UVM_PAGEABLE_MEM_ACCESS            = 39
 	UVM_SET_PREFERRED_LOCATION         = 42
+	UVM_UNSET_PREFERRED_LOCATION       = 43
 	UVM_DISABLE_READ_DUPLICATION       = 45
+	UVM_UNSET_ACCESSED_BY              = 47
+	UVM_MIGRATE                        = 51
+	UVM_MIGRATE_RANGE_GROUP            = 53
+	UVM_TOOLS_READ_PROCESS_MEMORY      = 62
+	UVM_TOOLS_WRITE_PROCESS_MEMORY     = 63
 	UVM_MAP_DYNAMIC_PARALLELISM_REGION = 65
+	UVM_UNMAP_EXTERNAL                 = 66
 	UVM_ALLOC_SEMAPHORE_POOL           = 68
 	UVM_VALIDATE_VA_RANGE              = 72
 	UVM_CREATE_EXTERNAL_RANGE          = 73
@@ -51,7 +53,7 @@ const (
 
 // +marshal
 type UVM_INITIALIZE_PARAMS struct {
-	Flags    uint64
+	Flags    uint64 `nvproxy:"same"`
 	RMStatus uint32
 	Pad0     [4]byte
 }
@@ -63,44 +65,46 @@ const (
 
 // +marshal
 type UVM_CREATE_RANGE_GROUP_PARAMS struct {
-	RangeGroupID uint64
+	RangeGroupID uint64 `nvproxy:"same"`
 	RMStatus     uint32
 	Pad0         [4]byte
 }
 
 // +marshal
 type UVM_DESTROY_RANGE_GROUP_PARAMS struct {
-	RangeGroupID uint64
+	RangeGroupID uint64 `nvproxy:"same"`
 	RMStatus     uint32
 	Pad0         [4]byte
 }
 
 // +marshal
 type UVM_REGISTER_GPU_VASPACE_PARAMS struct {
-	GPUUUID  NvUuid
+	GPUUUID  NvUUID `nvproxy:"same"`
 	RMCtrlFD int32
 	HClient  Handle
 	HVASpace Handle
 	RMStatus uint32
 }
 
-func (p *UVM_REGISTER_GPU_VASPACE_PARAMS) GetRMCtrlFD() int32 {
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *UVM_REGISTER_GPU_VASPACE_PARAMS) GetFrontendFD() int32 {
 	return p.RMCtrlFD
 }
 
-func (p *UVM_REGISTER_GPU_VASPACE_PARAMS) SetRMCtrlFD(fd int32) {
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *UVM_REGISTER_GPU_VASPACE_PARAMS) SetFrontendFD(fd int32) {
 	p.RMCtrlFD = fd
 }
 
 // +marshal
 type UVM_UNREGISTER_GPU_VASPACE_PARAMS struct {
-	GPUUUID  NvUuid
+	GPUUUID  NvUUID `nvproxy:"same"`
 	RMStatus uint32
 }
 
 // +marshal
 type UVM_REGISTER_CHANNEL_PARAMS struct {
-	GPUUUID  NvUuid
+	GPUUUID  NvUUID `nvproxy:"same"`
 	RMCtrlFD int32
 	HClient  Handle
 	HChannel Handle
@@ -111,46 +115,96 @@ type UVM_REGISTER_CHANNEL_PARAMS struct {
 	Pad0     [4]byte
 }
 
-func (p *UVM_REGISTER_CHANNEL_PARAMS) GetRMCtrlFD() int32 {
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *UVM_REGISTER_CHANNEL_PARAMS) GetFrontendFD() int32 {
 	return p.RMCtrlFD
 }
 
-func (p *UVM_REGISTER_CHANNEL_PARAMS) SetRMCtrlFD(fd int32) {
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *UVM_REGISTER_CHANNEL_PARAMS) SetFrontendFD(fd int32) {
 	p.RMCtrlFD = fd
 }
 
 // +marshal
 type UVM_UNREGISTER_CHANNEL_PARAMS struct {
-	GPUUUID  NvUuid
+	GPUUUID  NvUUID `nvproxy:"same"`
 	HClient  Handle
 	HChannel Handle
 	RMStatus uint32
 }
 
 // +marshal
+type UVM_ENABLE_PEER_ACCESS_PARAMS struct {
+	GPUUUIDA NvUUID `nvproxy:"same"`
+	GPUUUIDB NvUUID
+	RMStatus uint32
+}
+
+// +marshal
+type UVM_DISABLE_PEER_ACCESS_PARAMS struct {
+	GPUUUIDA NvUUID `nvproxy:"same"`
+	GPUUUIDB NvUUID
+	RMStatus uint32
+}
+
+// +marshal
+type UVM_SET_RANGE_GROUP_PARAMS struct {
+	RangeGroupID  uint64 `nvproxy:"same"`
+	RequestedBase uint64
+	Length        uint64
+	RMStatus      uint32
+	Pad0          [4]byte
+}
+
+// +marshal
 type UVM_MAP_EXTERNAL_ALLOCATION_PARAMS struct {
-	Base               uint64
+	Base               uint64 `nvproxy:"same"`
 	Length             uint64
 	Offset             uint64
 	PerGPUAttributes   [UVM_MAX_GPUS]UvmGpuMappingAttributes
 	GPUAttributesCount uint64
 	RMCtrlFD           int32
-	HClient            Handle
-	HMemory            Handle
+	HClient            uint32 // These are treated like NvHandle, but the driver uses NvU32.
+	HMemory            uint32 // These are treated like NvHandle, but the driver uses NvU32.
 	RMStatus           uint32
 }
 
-func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS) GetRMCtrlFD() int32 {
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS) GetFrontendFD() int32 {
 	return p.RMCtrlFD
 }
 
-func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS) SetRMCtrlFD(fd int32) {
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS) SetFrontendFD(fd int32) {
+	p.RMCtrlFD = fd
+}
+
+// +marshal
+type UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550 struct {
+	Base               uint64 `nvproxy:"UVM_MAP_EXTERNAL_ALLOCATION_PARAMS"`
+	Length             uint64
+	Offset             uint64
+	PerGPUAttributes   [UVM_MAX_GPUS_V2]UvmGpuMappingAttributes
+	GPUAttributesCount uint64
+	RMCtrlFD           int32
+	HClient            uint32 // These are treated like NvHandle, but the driver uses NvU32.
+	HMemory            uint32 // These are treated like NvHandle, but the driver uses NvU32.
+	RMStatus           uint32
+}
+
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550) GetFrontendFD() int32 {
+	return p.RMCtrlFD
+}
+
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550) SetFrontendFD(fd int32) {
 	p.RMCtrlFD = fd
 }
 
 // +marshal
 type UVM_FREE_PARAMS struct {
-	Base     uint64
+	Base     uint64 `nvproxy:"same"`
 	Length   uint64
 	RMStatus uint32
 	Pad0     [4]byte
@@ -158,7 +212,7 @@ type UVM_FREE_PARAMS struct {
 
 // +marshal
 type UVM_REGISTER_GPU_PARAMS struct {
-	GPUUUID     NvUuid
+	GPUUUID     NvUUID `nvproxy:"same"`
 	NumaEnabled uint8
 	Pad         [3]byte
 	NumaNodeID  int32
@@ -168,56 +222,156 @@ type UVM_REGISTER_GPU_PARAMS struct {
 	RMStatus    uint32
 }
 
-func (p *UVM_REGISTER_GPU_PARAMS) GetRMCtrlFD() int32 {
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *UVM_REGISTER_GPU_PARAMS) GetFrontendFD() int32 {
 	return p.RMCtrlFD
 }
 
-func (p *UVM_REGISTER_GPU_PARAMS) SetRMCtrlFD(fd int32) {
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *UVM_REGISTER_GPU_PARAMS) SetFrontendFD(fd int32) {
 	p.RMCtrlFD = fd
 }
 
 // +marshal
 type UVM_UNREGISTER_GPU_PARAMS struct {
-	GPUUUID  NvUuid
+	GPUUUID  NvUUID `nvproxy:"same"`
 	RMStatus uint32
 }
 
 // +marshal
 type UVM_PAGEABLE_MEM_ACCESS_PARAMS struct {
-	PageableMemAccess uint8
+	PageableMemAccess uint8 `nvproxy:"same"`
 	Pad               [3]byte
 	RMStatus          uint32
 }
 
 // +marshal
 type UVM_SET_PREFERRED_LOCATION_PARAMS struct {
-	RequestedBase   uint64
-	Length          uint64
-	NvProcessorUUID NvUuid
-	RMStatus        uint32
-	Pad0            [4]byte
+	RequestedBase     uint64 `nvproxy:"same"`
+	Length            uint64
+	PreferredLocation NvUUID
+	RMStatus          uint32
+	Pad0              [4]byte
 }
 
 // +marshal
-type UVM_DISABLE_READ_DUPLICATION_PARAMS struct {
-	RequestedBase uint64
+type UVM_SET_PREFERRED_LOCATION_PARAMS_V550 struct {
+	RequestedBase        uint64 `nvproxy:"UVM_SET_PREFERRED_LOCATION_PARAMS"`
+	Length               uint64
+	PreferredLocation    NvUUID
+	PreferredCPUNumaNode int32
+	RMStatus             uint32
+}
+
+// +marshal
+type UVM_UNSET_PREFERRED_LOCATION_PARAMS struct {
+	RequestedBase uint64 `nvproxy:"same"`
 	Length        uint64
 	RMStatus      uint32
 	Pad0          [4]byte
 }
 
 // +marshal
+type UVM_DISABLE_READ_DUPLICATION_PARAMS struct {
+	RequestedBase uint64 `nvproxy:"same"`
+	Length        uint64
+	RMStatus      uint32
+	Pad0          [4]byte
+}
+
+// +marshal
+type UVM_UNSET_ACCESSED_BY_PARAMS struct {
+	RequestedBase  uint64 `nvproxy:"same"`
+	Length         uint64
+	AccessedByUUID NvUUID
+	RMStatus       uint32
+	Pad0           [4]byte
+}
+
+// +marshal
+type UVM_MIGRATE_PARAMS struct {
+	Base             uint64 `nvproxy:"same"`
+	Length           uint64
+	DestinationUUID  NvUUID
+	Flags            uint32
+	_                [4]byte
+	SemaphoreAddress uint64
+	SemaphorePayload uint32
+	CPUNumaNode      uint32
+	UserSpaceStart   uint64
+	UserSpaceLength  uint64
+	RMStatus         uint32
+	_                [4]byte
+}
+
+// UVM_MIGRATE_PARAMS_V550 is the updated version of
+// UVM_MIGRATE_PARAMS since 550.40.07.
+//
+// +marshal
+type UVM_MIGRATE_PARAMS_V550 struct {
+	Base             uint64 `nvproxy:"UVM_MIGRATE_PARAMS"`
+	Length           uint64
+	DestinationUUID  NvUUID
+	Flags            uint32
+	_                [4]byte
+	SemaphoreAddress uint64
+	SemaphorePayload uint32
+	CPUNumaNode      int32
+	UserSpaceStart   uint64
+	UserSpaceLength  uint64
+	RMStatus         uint32
+	_                [4]byte
+}
+
+// +marshal
+type UVM_MIGRATE_RANGE_GROUP_PARAMS struct {
+	RangeGroupID    uint64 `nvproxy:"same"`
+	DestinationUUID NvUUID
+	RMStatus        uint32
+	Pad0            [4]byte
+}
+
+// +marshal
+type UVM_TOOLS_READ_PROCESS_MEMORY_PARAMS struct {
+	Buffer    uint64 `nvproxy:"same"`
+	Size      uint64
+	TargetVA  uint64
+	BytesRead uint64
+	RMStatus  uint32
+	Pad0      [4]byte
+}
+
+// +marshal
+type UVM_TOOLS_WRITE_PROCESS_MEMORY_PARAMS struct {
+	Buffer       uint64 `nvproxy:"same"`
+	Size         uint64
+	TargetVA     uint64
+	BytesWritten uint64
+	RMStatus     uint32
+	Pad0         [4]byte
+}
+
+// +marshal
 type UVM_MAP_DYNAMIC_PARALLELISM_REGION_PARAMS struct {
-	Base     uint64
+	Base     uint64 `nvproxy:"same"`
 	Length   uint64
-	GPUUUID  NvUuid
+	GPUUUID  NvUUID
+	RMStatus uint32
+	Pad0     [4]byte
+}
+
+// +marshal
+type UVM_UNMAP_EXTERNAL_PARAMS struct {
+	Base     uint64 `nvproxy:"same"`
+	Length   uint64
+	GPUUUID  NvUUID
 	RMStatus uint32
 	Pad0     [4]byte
 }
 
 // +marshal
 type UVM_ALLOC_SEMAPHORE_POOL_PARAMS struct {
-	Base               uint64
+	Base               uint64 `nvproxy:"same"`
 	Length             uint64
 	PerGPUAttributes   [UVM_MAX_GPUS]UvmGpuMappingAttributes
 	GPUAttributesCount uint64
@@ -226,8 +380,18 @@ type UVM_ALLOC_SEMAPHORE_POOL_PARAMS struct {
 }
 
 // +marshal
+type UVM_ALLOC_SEMAPHORE_POOL_PARAMS_V550 struct {
+	Base               uint64 `nvproxy:"UVM_ALLOC_SEMAPHORE_POOL_PARAMS"`
+	Length             uint64
+	PerGPUAttributes   [UVM_MAX_GPUS_V2]UvmGpuMappingAttributes
+	GPUAttributesCount uint64
+	RMStatus           uint32
+	Pad0               [4]byte
+}
+
+// +marshal
 type UVM_VALIDATE_VA_RANGE_PARAMS struct {
-	Base     uint64
+	Base     uint64 `nvproxy:"same"`
 	Length   uint64
 	RMStatus uint32
 	Pad0     [4]byte
@@ -235,7 +399,7 @@ type UVM_VALIDATE_VA_RANGE_PARAMS struct {
 
 // +marshal
 type UVM_CREATE_EXTERNAL_RANGE_PARAMS struct {
-	Base     uint64
+	Base     uint64 `nvproxy:"same"`
 	Length   uint64
 	RMStatus uint32
 	Pad0     [4]byte
@@ -243,17 +407,20 @@ type UVM_CREATE_EXTERNAL_RANGE_PARAMS struct {
 
 // +marshal
 type UVM_MM_INITIALIZE_PARAMS struct {
-	UvmFD  int32
+	UvmFD  int32 `nvproxy:"same"`
 	Status uint32
 }
 
 // From kernel-open/nvidia-uvm/uvm_types.h:
 
-const UVM_MAX_GPUS = NV_MAX_DEVICES
+const (
+	UVM_MAX_GPUS    = NV_MAX_DEVICES
+	UVM_MAX_GPUS_V2 = NV_MAX_DEVICES * NV_MAX_SUBDEVICES
+)
 
 // +marshal
 type UvmGpuMappingAttributes struct {
-	GPUUUID            NvUuid
+	GPUUUID            NvUUID
 	GPUMappingType     uint32
 	GPUCachingType     uint32
 	GPUFormatType      uint32

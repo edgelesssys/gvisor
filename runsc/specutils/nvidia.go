@@ -20,29 +20,20 @@ import (
 	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/runsc/config"
 )
 
 const nvdEnvVar = "NVIDIA_VISIBLE_DEVICES"
 
-// annotationNVProxy enables nvproxy.
-const annotationNVProxy = "dev.gvisor.internal.nvproxy"
+// AnnotationNVProxy enables nvproxy.
+const AnnotationNVProxy = "dev.gvisor.internal.nvproxy"
 
 // NVProxyEnabled checks both the nvproxy annotation and conf.NVProxy to see if nvproxy is enabled.
 func NVProxyEnabled(spec *specs.Spec, conf *config.Config) bool {
 	if conf.NVProxy {
 		return true
 	}
-	val, ok := spec.Annotations[annotationNVProxy]
-	if !ok {
-		return false
-	}
-	ret, err := strconv.ParseBool(val)
-	if err != nil {
-		log.Warningf("nvproxy annotation set to invalid value %q: %w. Skipping.", val, err)
-	}
-	return ret
+	return AnnotationToBool(spec, AnnotationNVProxy)
 }
 
 // GPUFunctionalityRequested returns true if the container should have access

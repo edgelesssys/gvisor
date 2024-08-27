@@ -47,8 +47,10 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
 	"gvisor.dev/gvisor/runsc/donation"
+	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/sandbox"
 	"gvisor.dev/gvisor/runsc/specutils"
+	"gvisor.dev/gvisor/runsc/starttime"
 )
 
 const cgroupParentAnnotation = "dev.gvisor.spec.cgroup-parent"
@@ -200,7 +202,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		return nil, err
 	}
 
-	if err := os.MkdirAll(conf.RootDir, 0711); err != nil {
+	if err := os.MkdirAll(conf.RootDir, 0o711); err != nil {
 		return nil, fmt.Errorf("creating container root directory %q: %v", conf.RootDir, err)
 	}
 
@@ -241,6 +243,9 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	// Lock the container metadata file to prevent concurrent creations of
 	// containers with the same id.
 	if err := c.Saver.LockForNew(); err != nil {
+		// As we have not allocated any resources yet, we revoke the clean-up operation.
+		// Otherwise, we may accidently destroy an existing container.
+		cu.Release()
 		return nil, fmt.Errorf("cannot lock container metadata file: %w", err)
 	}
 	defer c.Saver.UnlockOrDie()
@@ -338,7 +343,6 @@ func New(conf *config.Config, args Args) (*Container, error) {
 			}
 			c.Sandbox = sand
 			return nil
-
 		}); err != nil {
 			return nil, err
 		}
@@ -411,7 +415,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	// Write the PID file. Containerd considers the call to create complete after
 	// this file is created, so it must be the last thing we do.
 	if args.PIDFile != "" {
-		if err := ioutil.WriteFile(args.PIDFile, []byte(strconv.Itoa(c.SandboxPid())), 0644); err != nil {
+		if err := ioutil.WriteFile(args.PIDFile, []byte(strconv.Itoa(c.SandboxPid())), 0o644); err != nil {
 			return nil, fmt.Errorf("error writing PID file: %v", err)
 		}
 	}
@@ -423,14 +427,28 @@ func New(conf *config.Config, args Args) (*Container, error) {
 // Start starts running the containerized process inside the sandbox.
 func (c *Container) Start(conf *config.Config) error {
 	log.Debugf("Start container, cid: %s", c.ID)
+	return c.startImpl(conf, "start", c.Sandbox.StartRoot, c.Sandbox.StartSubcontainer)
+}
 
+// Restore takes a container and replaces its kernel and file system
+// to restore a container from its state file.
+func (c *Container) Restore(conf *config.Config, imagePath string, direct bool) error {
+	log.Debugf("Restore container, cid: %s", c.ID)
+
+	restore := func(conf *config.Config) error {
+		return c.Sandbox.Restore(conf, c.ID, imagePath, direct)
+	}
+	return c.startImpl(conf, "restore", restore, c.Sandbox.RestoreSubcontainer)
+}
+
+func (c *Container) startImpl(conf *config.Config, action string, startRoot func(conf *config.Config) error, startSub func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []boot.GoferMountConf) error) error {
 	if err := c.Saver.lock(BlockAcquire); err != nil {
 		return err
 	}
 	unlock := cleanup.Make(c.Saver.UnlockOrDie)
 	defer unlock.Clean()
 
-	if err := c.requireStatus("start", Created); err != nil {
+	if err := c.requireStatus(action, Created); err != nil {
 		return err
 	}
 
@@ -441,7 +459,7 @@ func (c *Container) Start(conf *config.Config) error {
 	}
 
 	if isRoot(c.Spec) {
-		if err := c.Sandbox.StartRoot(conf); err != nil {
+		if err := startRoot(conf); err != nil {
 			return err
 		}
 	} else {
@@ -492,7 +510,7 @@ func (c *Container) Start(conf *config.Config) error {
 				stdios = []*os.File{os.Stdin, os.Stdout, os.Stderr}
 			}
 
-			return c.Sandbox.StartSubcontainer(c.Spec, conf, c.ID, stdios, goferFiles, goferFilestores, devIOFile, goferConfs)
+			return startSub(c.Spec, conf, c.ID, stdios, goferFiles, goferFilestores, devIOFile, goferConfs)
 		}); err != nil {
 			return err
 		}
@@ -523,32 +541,6 @@ func (c *Container) Start(conf *config.Config) error {
 	return c.adjustGoferOOMScoreAdj()
 }
 
-// Restore takes a container and replaces its kernel and file system
-// to restore a container from its state file.
-func (c *Container) Restore(conf *config.Config, restoreFile string) error {
-	log.Debugf("Restore container, cid: %s", c.ID)
-	if err := c.Saver.lock(BlockAcquire); err != nil {
-		return err
-	}
-	defer c.Saver.UnlockOrDie()
-
-	if err := c.requireStatus("restore", Created); err != nil {
-		return err
-	}
-
-	// "If any prestart hook fails, the runtime MUST generate an error,
-	// stop and destroy the container" -OCI spec.
-	if c.Spec.Hooks != nil && len(c.Spec.Hooks.StartContainer) > 0 {
-		log.Warningf("StartContainer hook skipped because running inside container namespace is not supported")
-	}
-
-	if err := c.Sandbox.Restore(conf, c.ID, restoreFile); err != nil {
-		return err
-	}
-	c.changeStatus(Running)
-	return c.saveLocked()
-}
-
 // Run is a helper that calls Create + Start + Wait.
 func Run(conf *config.Config, args Args) (unix.WaitStatus, error) {
 	log.Debugf("Run container, cid: %s, rootDir: %q", args.ID, conf.RootDir)
@@ -563,15 +555,8 @@ func Run(conf *config.Config, args Args) (unix.WaitStatus, error) {
 	})
 	defer cu.Clean()
 
-	if conf.RestoreFile != "" {
-		log.Debugf("Restore: %v", conf.RestoreFile)
-		if err := c.Restore(conf, conf.RestoreFile); err != nil {
-			return 0, fmt.Errorf("starting container: %v", err)
-		}
-	} else {
-		if err := c.Start(conf); err != nil {
-			return 0, fmt.Errorf("starting container: %v", err)
-		}
+	if err := c.Start(conf); err != nil {
+		return 0, fmt.Errorf("starting container: %v", err)
 	}
 
 	// If we allocate a terminal, forward signals to the sandbox process.
@@ -670,6 +655,18 @@ func (c *Container) WaitPID(pid int32) (unix.WaitStatus, error) {
 	return c.Sandbox.WaitPID(c.ID, pid)
 }
 
+// WaitCheckpoint waits for the Kernel to have been successfully checkpointed
+// n-1 times, then waits for either the n-th successful checkpoint (in which
+// case it returns nil) or any number of failed checkpoints (in which case it
+// returns an error returned by any such failure).
+func (c *Container) WaitCheckpoint(n uint32) error {
+	log.Debugf("Wait on %d-th checkpoint to complete in container, cid: %s", n, c.ID)
+	if !c.IsSandboxRunning() {
+		return fmt.Errorf("sandbox is not running")
+	}
+	return c.Sandbox.WaitCheckpoint(n)
+}
+
 // SignalContainer sends the signal to the container. If all is true and signal
 // is SIGKILL, then waits for all processes to exit before returning.
 // SignalContainer returns an error if the container is already stopped.
@@ -721,12 +718,12 @@ func (c *Container) ForwardSignals(pid int32, fgProcess bool) func() {
 
 // Checkpoint sends the checkpoint call to the container.
 // The statefile will be written to f, the file at the specified image-path.
-func (c *Container) Checkpoint(f *os.File, options statefile.Options) error {
+func (c *Container) Checkpoint(imagePath string, direct bool, sfOpts statefile.Options, mfOpts pgalloc.SaveOpts) error {
 	log.Debugf("Checkpoint container, cid: %s", c.ID)
 	if err := c.requireStatus("checkpoint", Created, Running, Paused); err != nil {
 		return err
 	}
-	return c.Sandbox.Checkpoint(c.ID, f, options)
+	return c.Sandbox.Checkpoint(c.ID, imagePath, direct, sfOpts, mfOpts)
 }
 
 // Pause suspends the container and its kernel.
@@ -1027,7 +1024,7 @@ func (c *Container) createGoferFilestoreInSelf(mountSrc string, isShared bool, s
 		createFlags |= unix.O_EXCL
 	}
 	filestorePath := boot.SelfFilestorePath(mountSrc, c.sandboxID())
-	filestoreFD, err := unix.Open(filestorePath, createFlags, 0666)
+	filestoreFD, err := unix.Open(filestorePath, createFlags, 0o666)
 	if err != nil {
 		if err == unix.EEXIST {
 			// Note that if the same submount is mounted multiple times within the
@@ -1199,6 +1196,11 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *config.Config, bu
 		return []*os.File{ioFile}, nil, nil, nil
 	}
 
+	// Ensure we don't leak FDs to the gofer process.
+	if err := sandbox.SetCloExeOnAllFDs(); err != nil {
+		return nil, nil, nil, fmt.Errorf("setting CLOEXEC on all FDs: %w", err)
+	}
+
 	donations := donation.Agency{}
 	defer donations.Close()
 
@@ -1214,7 +1216,18 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *config.Config, bu
 			}
 		}
 		if specutils.IsDebugCommand(conf, "gofer") {
-			if err := donations.DonateDebugLogFile("debug-log-fd", conf.DebugLog, "gofer", test); err != nil {
+			// The startTime here can mean one of two things:
+			// - If this is the first gofer started at the same time as the sandbox,
+			//   then this starttime will exactly match the one used by the sandbox
+			//   itself (i.e. `Sandbox.StartTime`). This is desirable, such that the
+			//   first gofer's log filename will have the exact same timestamp as
+			//   the sandbox's log filename timestamp.
+			// - If this is not the first gofer, then this starttime will be later
+			//   than the sandbox start time; this is desirable such that we can
+			//   distinguish the gofer log filenames between each other.
+			// In either case, `starttime.Get` gets us the timestamp we want.
+			startTime := starttime.Get()
+			if err := donations.DonateDebugLogFile("debug-log-fd", conf.DebugLog, "gofer", test, startTime); err != nil {
 				return nil, nil, nil, err
 			}
 		}
@@ -1406,9 +1419,7 @@ func (c *Container) changeStatus(s Status) {
 		}
 
 	case Stopped:
-		if c.Status != Creating && c.Status != Created && c.Status != Running && c.Status != Stopped {
-			panic(fmt.Sprintf("invalid state transition: %v => %v", c.Status, s))
-		}
+		// All states can transition to Stopped.
 
 	default:
 		panic(fmt.Sprintf("invalid new state: %v", s))
@@ -1554,7 +1565,7 @@ func adjustSandboxOOMScoreAdj(s *sandbox.Sandbox, spec *specs.Spec, rootDir stri
 // /proc must be available and mounted read-write. scoreAdj should be between
 // -1000 and 1000. It's a noop if the process has already exited.
 func setOOMScoreAdj(pid int, scoreAdj int) error {
-	f, err := os.OpenFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid), os.O_WRONLY, 0644)
+	f, err := os.OpenFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid), os.O_WRONLY, 0o644)
 	if err != nil {
 		// Ignore NotExist errors because it can race with process exit.
 		if os.IsNotExist(err) {
@@ -1631,6 +1642,23 @@ func (c *Container) populateStats(event *boot.EventOut) {
 	return
 }
 
+func (c *Container) createParentCgroup(parentPath string, conf *config.Config) (cgroup.Cgroup, error) {
+	var err error
+	if conf.SystemdCgroup {
+		parentPath, err = cgroup.TransformSystemdPath(parentPath, c.ID, conf.Rootless)
+		if err != nil {
+			return nil, err
+		}
+	} else if cgroup.LikelySystemdPath(parentPath) {
+		log.Warningf("cgroup parent path is set to %q which looks like a systemd path. Please set --systemd-cgroup=true if you intend to use systemd to manage container cgroups", parentPath)
+	}
+	parentCgroup, err := cgroup.NewFromPath(parentPath, conf.SystemdCgroup)
+	if err != nil {
+		return nil, err
+	}
+	return parentCgroup, nil
+}
+
 // setupCgroupForRoot configures and returns cgroup for the sandbox and the
 // root container. If `cgroupParentAnnotation` is set, use that path as the
 // sandbox cgroup and use Spec.Linux.CgroupsPath as the root container cgroup.
@@ -1638,13 +1666,16 @@ func (c *Container) setupCgroupForRoot(conf *config.Config, spec *specs.Spec) (c
 	var parentCgroup cgroup.Cgroup
 	if parentPath, ok := spec.Annotations[cgroupParentAnnotation]; ok {
 		var err error
-		parentCgroup, err = cgroup.NewFromPath(parentPath, conf.SystemdCgroup)
+		parentCgroup, err = c.createParentCgroup(parentPath, conf)
 		if err != nil {
 			return nil, nil, err
 		}
 	} else {
 		var err error
-		parentCgroup, err = cgroup.NewFromSpec(spec, conf.SystemdCgroup)
+		if spec.Linux == nil || spec.Linux.CgroupsPath == "" {
+			return nil, nil, nil
+		}
+		parentCgroup, err = c.createParentCgroup(spec.Linux.CgroupsPath, conf)
 		if parentCgroup == nil || err != nil {
 			return nil, nil, err
 		}
@@ -1675,7 +1706,10 @@ func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.
 		}
 	}
 
-	cg, err := cgroup.NewFromSpec(spec, conf.SystemdCgroup)
+	if spec.Linux == nil || spec.Linux.CgroupsPath == "" {
+		return nil, nil
+	}
+	cg, err := c.createParentCgroup(spec.Linux.CgroupsPath, conf)
 	if cg == nil || err != nil {
 		return nil, err
 	}
@@ -1694,6 +1728,7 @@ func (c *Container) donateGoferProfileFDs(conf *config.Config, donations *donati
 	// into a single file.
 	profSuffix := ".gofer." + c.ID
 	const profFlags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	profile.UpdatePaths(conf, starttime.Get())
 	if conf.ProfileBlock != "" {
 		if err := donations.OpenAndDonate("profile-block-fd", conf.ProfileBlock+profSuffix, profFlags); err != nil {
 			return err
@@ -1936,7 +1971,7 @@ func nvproxySetupAfterGoferUserns(spec *specs.Spec, conf *config.Config, goferCm
 	}
 
 	// nvidia-container-cli does not create this directory.
-	if err := os.MkdirAll(path.Join(spec.Root.Path, "proc", "driver", "nvidia"), 0555); err != nil {
+	if err := os.MkdirAll(path.Join(spec.Root.Path, "proc", "driver", "nvidia"), 0o555); err != nil {
 		return nil, fmt.Errorf("failed to create /proc/driver/nvidia in app filesystem: %w", err)
 	}
 
@@ -1949,6 +1984,8 @@ func nvproxySetupAfterGoferUserns(spec *specs.Spec, conf *config.Config, goferCm
 	var ldconfigPath string
 	if _, err := os.Stat("/sbin/ldconfig.real"); err == nil {
 		ldconfigPath = "/sbin/ldconfig.real"
+	} else if _, err := os.Stat("/run/current-system/sw/bin/ldconfig"); err == nil {
+		ldconfigPath = "/run/current-system/sw/bin/ldconfig"
 	} else {
 		ldconfigPath = "/sbin/ldconfig"
 	}
@@ -1995,4 +2032,20 @@ func nvproxySetupAfterGoferUserns(spec *specs.Spec, conf *config.Config, goferCm
 		}
 		return nil
 	}, nil
+}
+
+// CheckStopped checks if the container is stopped and updates its status.
+func (c *Container) CheckStopped() {
+	if state, err := c.Sandbox.ContainerRuntimeState(c.ID); err != nil {
+		log.Warningf("Cannot find if container %v exists, checking if sandbox %v is running, err: %v", c.ID, c.Sandbox.ID, err)
+		if !c.IsSandboxRunning() {
+			log.Warningf("Sandbox isn't running anymore, marking container %v as stopped:", c.ID)
+			c.changeStatus(Stopped)
+		}
+	} else {
+		if state == boot.RuntimeStateStopped {
+			log.Warningf("Container %v is stopped", c.ID)
+			c.changeStatus(Stopped)
+		}
+	}
 }

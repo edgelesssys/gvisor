@@ -14,19 +14,41 @@
 
 package nvgpu
 
-// Class handles, from src/nvidia/generated/g_allclasses.h.
+import (
+	"fmt"
+)
+
+// ClassID is a client class ID, in the sense of
+// src/nvidia/src/kernel/rmapi/resource_desc.h:RS_RESOURCE_DESC::externalClassID.
+//
+// +marshal
+type ClassID uint32
+
+// String implements fmt.Stringer.String.
+func (id ClassID) String() string {
+	// Include leading zeroes for easier searchability, both here and in
+	// g_allclasses.h.
+	return fmt.Sprintf("0x%08x", uint32(id))
+}
+
+// Class IDs, from src/nvidia/generated/g_allclasses.h.
 const (
 	NV01_ROOT                        = 0x00000000
 	NV01_ROOT_NON_PRIV               = 0x00000001
 	NV01_MEMORY_SYSTEM               = 0x0000003e
+	NV01_MEMORY_LOCAL_USER           = 0x00000040
 	NV01_ROOT_CLIENT                 = 0x00000041
 	NV01_MEMORY_SYSTEM_OS_DESCRIPTOR = 0x00000071
 	NV01_EVENT_OS_EVENT              = 0x00000079
 	NV01_DEVICE_0                    = 0x00000080
+	RM_USER_SHARED_DATA              = 0x000000de
 	NV_MEMORY_FABRIC                 = 0x000000f8
+	NV_MEMORY_MULTICAST_FABRIC       = 0x000000fd
 	NV20_SUBDEVICE_0                 = 0x00002080
+	NV2081_BINAPI                    = 0x00002081
 	NV50_P2P                         = 0x0000503b
 	NV50_THIRD_PARTY_P2P             = 0x0000503c
+	NV50_MEMORY_VIRTUAL              = 0x000050a0
 	GT200_DEBUGGER                   = 0x000083de
 	GF100_SUBDEVICE_MASTER           = 0x000090e6
 	FERMI_CONTEXT_SHARE_A            = 0x00009067
@@ -42,20 +64,28 @@ const (
 	AMPERE_COMPUTE_A                 = 0x0000c6c0
 	AMPERE_DMA_COPY_B                = 0x0000c7b5
 	AMPERE_COMPUTE_B                 = 0x0000c7c0
-	HOPPER_DMA_COPY_A                = 0x0000c8b5
 	HOPPER_CHANNEL_GPFIFO_A          = 0x0000c86f
+	HOPPER_DMA_COPY_A                = 0x0000c8b5
 	ADA_COMPUTE_A                    = 0x0000c9c0
 	NV_CONFIDENTIAL_COMPUTE          = 0x0000cb33
-	HOPPER_COMPUTE_A                 = 0x0000cbc0
 	HOPPER_SEC2_WORK_LAUNCH_A        = 0x0000cba2
+	HOPPER_COMPUTE_A                 = 0x0000cbc0
 )
+
+// NV2081_ALLOC_PARAMETERS is the alloc params type for NV2081_BINAPI, from
+// src/common/sdk/nvidia/inc/class/cl2081.h.
+//
+// +marshal
+type NV2081_ALLOC_PARAMETERS struct {
+	Reserved uint32 `nvproxy:"same"`
+}
 
 // NV0005_ALLOC_PARAMETERS is the alloc params type for NV01_EVENT_OS_EVENT,
 // from src/common/sdk/nvidia/inc/class/cl0005.h.
 //
 // +marshal
 type NV0005_ALLOC_PARAMETERS struct {
-	HParentClient Handle
+	HParentClient Handle `nvproxy:"same"`
 	HSrcResource  Handle
 	HClass        uint32
 	NotifyIndex   uint32
@@ -67,7 +97,7 @@ type NV0005_ALLOC_PARAMETERS struct {
 //
 // +marshal
 type NV0080_ALLOC_PARAMETERS struct {
-	DeviceID        uint32
+	DeviceID        uint32 `nvproxy:"same"`
 	HClientShare    Handle
 	HTargetClient   Handle
 	HTargetDevice   Handle
@@ -85,7 +115,55 @@ type NV0080_ALLOC_PARAMETERS struct {
 //
 // +marshal
 type NV2080_ALLOC_PARAMETERS struct {
-	SubDeviceID uint32
+	SubDeviceID uint32 `nvproxy:"same"`
+}
+
+// NV_MEMORY_ALLOCATION_PARAMS is the alloc params type for various NV*_MEMORY*
+// allocation classes, from src/common/sdk/nvidia/inc/nvos.h.
+//
+// +marshal
+type NV_MEMORY_ALLOCATION_PARAMS struct {
+	Owner         uint32 `nvproxy:"same"`
+	Type          uint32
+	Flags         uint32
+	Width         uint32
+	Height        uint32
+	Pitch         int32
+	Attr          uint32
+	Attr2         uint32
+	Format        uint32
+	ComprCovg     uint32
+	ZcullCovg     uint32
+	_             uint32
+	RangeLo       uint64
+	RangeHi       uint64
+	Size          uint64
+	Alignment     uint64
+	Offset        uint64
+	Limit         uint64
+	Address       P64
+	CtagOffset    uint32
+	HVASpace      Handle
+	InternalFlags uint32
+	Tag           uint32
+}
+
+// NV_MEMORY_ALLOCATION_PARAMS_V545 is the updated version of
+// NV_MEMORY_ALLOCATION_PARAMS since 545.23.06.
+//
+// +marshal
+type NV_MEMORY_ALLOCATION_PARAMS_V545 struct {
+	NV_MEMORY_ALLOCATION_PARAMS `nvproxy:"NV_MEMORY_ALLOCATION_PARAMS"`
+	NumaNode                    int32
+	_                           uint32
+}
+
+// NV503B_BAR1_P2P_DMA_INFO from src/common/sdk/nvidia/inc/class/cl503b.h.
+//
+// +marshal
+type NV503B_BAR1_P2P_DMA_INFO struct {
+	DmaAddress uint64 `nvproxy:"same"`
+	DmaSize    uint64
 }
 
 // NV503B_ALLOC_PARAMETERS is the alloc params type for NV50_P2P, from
@@ -93,29 +171,13 @@ type NV2080_ALLOC_PARAMETERS struct {
 //
 // +marshal
 type NV503B_ALLOC_PARAMETERS struct {
-	HSubDevice              Handle
-	HPeerSubDevice          Handle
-	SubDevicePeerIDMask     uint32
-	PeerSubDevicePeerIDMask uint32
-	MailboxBar1Addr         uint64
-	MailboxTotalSize        uint32
-	Flags                   uint32
-}
-
-// NV503B_BAR1_P2P_DMA_INFO from src/common/sdk/nvidia/inc/class/cl503b.h.
-//
-// +marshal
-type NV503B_BAR1_P2P_DMA_INFO struct {
-	DmaAddress uint64
-	DmaSize    uint64
-}
-
-// NV503B_ALLOC_PARAMETERS_V535 is the updated version of
-// NV503B_ALLOC_PARAMETERS since 535.43.02.
-//
-// +marshal
-type NV503B_ALLOC_PARAMETERS_V535 struct {
-	NV503B_ALLOC_PARAMETERS
+	HSubDevice                 Handle `nvproxy:"same"`
+	HPeerSubDevice             Handle
+	SubDevicePeerIDMask        uint32
+	PeerSubDevicePeerIDMask    uint32
+	MailboxBar1Addr            uint64
+	MailboxTotalSize           uint32
+	Flags                      uint32
 	SubDeviceEgmPeerIDMask     uint32
 	PeerSubDeviceEgmPeerIDMask uint32
 	L2pBar1P2PDmaInfo          NV503B_BAR1_P2P_DMA_INFO
@@ -127,7 +189,7 @@ type NV503B_ALLOC_PARAMETERS_V535 struct {
 //
 // +marshal
 type NV503C_ALLOC_PARAMETERS struct {
-	Flags uint32
+	Flags uint32 `nvproxy:"same"`
 }
 
 // NV83DE_ALLOC_PARAMETERS is the alloc params type for GT200_DEBUGGER,
@@ -135,7 +197,7 @@ type NV503C_ALLOC_PARAMETERS struct {
 //
 // +marshal
 type NV83DE_ALLOC_PARAMETERS struct {
-	HDebuggerClient_Obsolete Handle
+	HDebuggerClient_Obsolete Handle `nvproxy:"same"`
 	HAppClient               Handle
 	HClass3DObject           Handle
 }
@@ -145,7 +207,7 @@ type NV83DE_ALLOC_PARAMETERS struct {
 //
 // +marshal
 type NV_CTXSHARE_ALLOCATION_PARAMETERS struct {
-	HVASpace Handle
+	HVASpace Handle `nvproxy:"same"`
 	Flags    uint32
 	SubctxID uint32
 }
@@ -155,7 +217,7 @@ type NV_CTXSHARE_ALLOCATION_PARAMETERS struct {
 //
 // +marshal
 type NV_VASPACE_ALLOCATION_PARAMETERS struct {
-	Index           uint32
+	Index           uint32 `nvproxy:"same"`
 	Flags           uint32
 	VASize          uint64
 	VAStartInternal uint64
@@ -170,7 +232,7 @@ type NV_VASPACE_ALLOCATION_PARAMETERS struct {
 //
 // +marshal
 type NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS struct {
-	HObjectError                Handle
+	HObjectError                Handle `nvproxy:"same"`
 	HObjectECCError             Handle
 	HVASpace                    Handle
 	EngineType                  uint32
@@ -183,7 +245,7 @@ type NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS struct {
 //
 // +marshal
 type NV_MEMORY_DESC_PARAMS struct {
-	Base         uint64
+	Base         uint64 `nvproxy:"same"`
 	Size         uint64
 	AddressSpace uint32
 	CacheAttrib  uint32
@@ -195,7 +257,7 @@ type NV_MEMORY_DESC_PARAMS struct {
 //
 // +marshal
 type NV_CHANNEL_ALLOC_PARAMS struct {
-	HObjectError        Handle
+	HObjectError        Handle `nvproxy:"same"`
 	HObjectBuffer       Handle
 	GPFIFOOffset        uint64
 	GPFIFOEntries       uint32
@@ -218,17 +280,9 @@ type NV_CHANNEL_ALLOC_PARAMS struct {
 	ECCErrorNotifierMem NV_MEMORY_DESC_PARAMS
 	ProcessID           uint32
 	SubProcessID        uint32
-}
-
-// NV_CHANNEL_ALLOC_PARAMS_V535 is the updated version of
-// NV_CHANNEL_ALLOC_PARAMS since 535.86.05.
-//
-// +marshal
-type NV_CHANNEL_ALLOC_PARAMS_V535 struct {
-	NV_CHANNEL_ALLOC_PARAMS
-	EncryptIv [CC_CHAN_ALLOC_IV_SIZE_DWORD]uint32
-	DecryptIv [CC_CHAN_ALLOC_IV_SIZE_DWORD]uint32
-	HmacNonce [CC_CHAN_ALLOC_NONCE_SIZE_DWORD]uint32
+	EncryptIv           [CC_CHAN_ALLOC_IV_SIZE_DWORD]uint32
+	DecryptIv           [CC_CHAN_ALLOC_IV_SIZE_DWORD]uint32
+	HmacNonce           [CC_CHAN_ALLOC_NONCE_SIZE_DWORD]uint32
 }
 
 // NVB0B5_ALLOCATION_PARAMETERS is the alloc param type for TURING_DMA_COPY_A,
@@ -237,7 +291,7 @@ type NV_CHANNEL_ALLOC_PARAMS_V535 struct {
 //
 // +marshal
 type NVB0B5_ALLOCATION_PARAMETERS struct {
-	Version    uint32
+	Version    uint32 `nvproxy:"same"`
 	EngineType uint32
 }
 
@@ -246,7 +300,7 @@ type NVB0B5_ALLOCATION_PARAMETERS struct {
 //
 // +marshal
 type NV_GR_ALLOCATION_PARAMETERS struct {
-	Version uint32
+	Version uint32 `nvproxy:"same"`
 	Flags   uint32
 	Size    uint32
 	Caps    uint32
@@ -257,8 +311,24 @@ type NV_GR_ALLOCATION_PARAMETERS struct {
 //
 // +marshal
 type NV_HOPPER_USERMODE_A_PARAMS struct {
-	Bar1Mapping uint8
+	Bar1Mapping uint8 `nvproxy:"same"`
 	Priv        uint8
+}
+
+// NV00DE_ALLOC_PARAMETERS is the alloc param type for RM_USER_SHARED_DATA,
+// from src/common/sdk/nvidia/inc/class/cl00de.h.
+//
+// +marshal
+type NV00DE_ALLOC_PARAMETERS struct {
+	Reserved uint32 `nvproxy:"same"`
+}
+
+// NV00DE_ALLOC_PARAMETERS_V545 is the updated version of
+// NV00DE_ALLOC_PARAMETERS since 545.23.06.
+//
+// +marshal
+type NV00DE_ALLOC_PARAMETERS_V545 struct {
+	PolledDataMask uint64 `nvproxy:"NV00DE_ALLOC_PARAMETERS"`
 }
 
 // +marshal
@@ -273,19 +343,7 @@ type nv00f8Map struct {
 //
 // +marshal
 type NV00F8_ALLOCATION_PARAMETERS struct {
-	Alignment  uint64
-	AllocSize  uint64
-	PageSize   uint32
-	AllocFlags uint32
-	Map        nv00f8Map
-}
-
-// NV00F8_ALLOCATION_PARAMETERS_V535 is the updated version of
-// NV00F8_ALLOCATION_PARAMETERS since 535.43.02.
-//
-// +marshal
-type NV00F8_ALLOCATION_PARAMETERS_V535 struct {
-	Alignment  uint64
+	Alignment  uint64 `nvproxy:"same"`
 	AllocSize  uint64
 	PageSize   uint64
 	AllocFlags uint32
@@ -293,11 +351,49 @@ type NV00F8_ALLOCATION_PARAMETERS_V535 struct {
 	Map        nv00f8Map
 }
 
+// From src/common/sdk/nvidia/inc/class/cl00e0.h
+const (
+	NV_MEM_EXPORT_UUID_LEN = 16
+)
+
+// NV_EXPORT_MEM_PACKET is from
+// src/common/sdk/nvidia/inc/class/cl00e0.h
+//
+// +marshal
+type NV_EXPORT_MEM_PACKET struct {
+	UUID   [NV_MEM_EXPORT_UUID_LEN]uint8
+	Opaque [16]uint8
+}
+
+// NV00FD_ALLOCATION_PARAMETERS is the alloc param type for NV_MEMORY_MULTICAST_FABRIC
+// from src/common/sdk/nvidia/inc/class/cl00fd.h
+//
+// +marshal
+type NV00FD_ALLOCATION_PARAMETERS struct {
+	Alignment  uint64 `nvproxy:"same"`
+	AllocSize  uint64
+	PageSize   uint32
+	AllocFlags uint32
+	NumGPUs    uint32
+	_          uint32
+	POsEvent   P64
+}
+
+// NV00FD_ALLOCATION_PARAMETERS_V545 is the updated version of
+// NV00FD_ALLOCATION_PARAMETERS since 545.23.06.
+//
+// +marshal
+type NV00FD_ALLOCATION_PARAMETERS_V545 struct {
+	ExpPacket NV_EXPORT_MEM_PACKET `nvproxy:"NV00FD_ALLOCATION_PARAMETERS"`
+	Index     uint16
+	_         [6]byte
+	NV00FD_ALLOCATION_PARAMETERS
+}
+
 // NV_CONFIDENTIAL_COMPUTE_ALLOC_PARAMS is the alloc param type for
 // NV_CONFIDENTIAL_COMPUTE, from src/common/sdk/nvidia/inc/class/clcb33.h.
 //
 // +marshal
 type NV_CONFIDENTIAL_COMPUTE_ALLOC_PARAMS struct {
-	Handle Handle
-	_      uint32
+	Handle Handle `nvproxy:"same"`
 }
